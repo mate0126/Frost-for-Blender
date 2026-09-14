@@ -11,7 +11,7 @@
 bl_info = {
     "name": "Frost Render Engine",
     "author": "Mate Szollos",
-    "version": (1, 1, 2),
+    "version": (1, 1, 3),
     "blender": (4, 2, 0),
     "location": "Render Properties > Render Engine > Frost",
     "description": "Render with Frost, FrioStudio's path tracer, on Apple silicon Macs",
@@ -20,16 +20,18 @@ bl_info = {
 
 import bpy
 
-from . import engine, properties, ui
+from . import bake, engine, properties, ui
 
 
 def register():
     properties.register()
     engine.register()
+    bake.register()
     ui.register()
 
 
 def unregister():
     ui.unregister()
+    bake.unregister()
     engine.unregister()
     properties.unregister()

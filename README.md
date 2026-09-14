@@ -59,6 +59,29 @@ own the first time it renders).
 Frost's own rows are in Render Properties: samples, bounces, denoise,
 adaptive sampling with its noise threshold, filter glossy, and exposure.
 
+## Baking what Frost cannot read
+
+Frost reads the Principled BSDF and the pictures wired into it by the
+mesh's UVs -- and now, for what it is nearest to, a Diffuse, Glossy or
+Metallic, Emission, Glass, Translucent or Transparent shader, and a Mix or
+Add of those, so a material without a Principled still comes through with
+its colour, its shine and its glow. What no exporter can hand over as it
+is: a procedural graph (noise, ramps, mixes by pointiness or vertex
+colour) and a picture mapped by Generated or Object coordinates rather
+than UVs. The Frost panel counts the objects whose materials are like
+that, and **Bake Materials for Frost** bakes them the way every pipeline
+that hands a Blender scene to another renderer does: Cycles bakes each
+such material's colour, roughness, normal and emission into pictures at
+the size you choose (1024 by default), on a UV map made for it by Smart
+UV Project, once per object -- a bake is of the material on that object,
+since Generated coordinates depend on the object's bounds -- and Frost
+renders with the pictures in the material's place. The pictures live in
+`~/Library/Caches/Frost for Blender/bakes/<file>/`, the object remembers
+them in a custom property, and **Forget the Bakes** takes that off. Bake
+again after changing a baked material; the count in the panel says when
+nothing needs it. Metallic is taken as the material's value, since Cycles
+has no bake for it.
+
 ## The traced viewport
 
 Set the viewport's shading to **Rendered** and Frost traces it live, the

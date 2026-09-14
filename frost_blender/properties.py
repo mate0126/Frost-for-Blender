@@ -8,7 +8,7 @@ import stat
 import subprocess
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
 
 class FrostSceneSettings(bpy.types.PropertyGroup):
@@ -34,6 +34,13 @@ class FrostSceneSettings(bpy.types.PropertyGroup):
     exposure: FloatProperty(
         name="Exposure", default=1.0, min=0.01, max=100.0,
         description="Multiplies the picture before the tonemap")
+    bake_size: EnumProperty(
+        name="Bake Size",
+        description="The size of the textures Bake Materials for Frost makes, per material on each object",
+        items=(('512', "512", "Quick; a small prop"), ('1024', "1024", "Most objects"),
+               ('2048', "2048", "A hero object, or the ground"), ('4096', "4096", "Slow; a whole vehicle")),
+        default='1024',
+    )
     viewport_scale: FloatProperty(
         name="Viewport Scale", default=0.5, min=0.125, max=1.0,
         description="The traced viewport's resolution as a fraction of the region: a half is four times "

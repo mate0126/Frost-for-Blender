@@ -3,7 +3,7 @@
 
 import bpy
 
-from . import properties
+from . import bake, properties
 
 
 class RENDER_PT_frost(bpy.types.Panel):
@@ -32,6 +32,25 @@ class RENDER_PT_frost(bpy.types.Panel):
         layout.prop(settings, "filter_glossy")
         layout.prop(settings, "exposure")
         layout.prop(settings, "viewport_scale")
+
+        # What Frost cannot read -- a procedural node graph, a picture mapped
+        # by Generated coordinates, a shader that is not the Principled --
+        # is baked to textures once, and the export uses those instead.
+        box = layout.box()
+        pending = bake.objects_needing_bake(context.scene)
+        baked = [o for o in context.scene.objects if o.type == 'MESH' and o.get(bake.BAKE_KEY) is not None]
+        if pending:
+            box.label(text="%d object%s use materials Frost cannot read." % (len(pending), "" if len(pending) == 1 else "s"),
+                      icon='INFO')
+        elif baked:
+            box.label(text="Every material is readable; %d baked." % len(baked), icon='CHECKMARK')
+        else:
+            box.label(text="Every material here is one Frost reads.", icon='CHECKMARK')
+        row = box.row(align=True)
+        row.operator("frost.bake", text="Bake Materials for Frost", icon='RENDER_STILL')
+        row.prop(settings, "bake_size", text="")
+        if baked:
+            box.operator("frost.clear_bake", text="Forget the Bakes", icon='X')
 
         frost = properties.find_frost(properties.preferences(context))
         box = layout.box()

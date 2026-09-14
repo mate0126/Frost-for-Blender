@@ -93,6 +93,27 @@ class GltfWriter:
         self.image_index[key] = len(self.textures) - 1
         return self.image_index[key]
 
+    def image_file(self, path):
+        """A picture already on disk -- a bake -- linked beside the glTF."""
+        if not path or not os.path.isfile(path):
+            return None
+        key = "file:" + path
+        if key in self.image_index:
+            return self.image_index[key]
+        folder = os.path.join(self.out_dir, "textures")
+        os.makedirs(folder, exist_ok=True)
+        name = os.path.basename(path)
+        target = os.path.join(folder, name)
+        if not os.path.exists(target):
+            try:
+                os.symlink(path, target)
+            except OSError:
+                shutil.copyfile(path, target)
+        self.images.append({"uri": "textures/" + name})
+        self.textures.append({"source": len(self.images) - 1, "sampler": 0})
+        self.image_index[key] = len(self.textures) - 1
+        return self.image_index[key]
+
     def write(self, name):
         path = os.path.join(self.out_dir, name + ".gltf")
         with open(os.path.join(self.out_dir, name + ".bin"), "wb") as f:
@@ -117,6 +138,12 @@ class GltfWriter:
         with open(path, "w") as f:
             json.dump(document, f)
         return path
+
+
+# The bake's UV map on a mesh, and the custom property on an object that
+# names its baked pictures (bake.py makes both; the export reads them).
+BAKE_UV = "FrostBake"
+BAKE_KEY = "frost_bake"
 
 
 def cache_folder():
@@ -233,7 +260,11 @@ def trace_image(sock):
     factor = None
     for _ in range(6):
         if node.type == 'TEX_IMAGE':
-            return (node.image, factor) if node.image is not None else (None, None)
+            # A picture mapped by position rather than by the mesh's UVs is
+            # one Frost cannot read as it is: only a bake hands it over.
+            if node.image is None or not uv_mapped(node):
+                return None, None
+            return node.image, factor
         if node.type in {'NORMAL_MAP', 'SEPARATE_COLOR', 'SEPRGB'}:
             next_socket = socket(node, "Color", "Image")
         elif node.type in {'MIX', 'MIX_RGB'} and getattr(node, "blend_type", 'MULTIPLY') == 'MULTIPLY':
@@ -266,6 +297,183 @@ def image_behind(sock):
     return trace_image(sock)[0]
 
 
+def uv_mapped(node):
+    """Whether an Image Texture reads by the mesh's UVs, which is the only
+    mapping Frost has: an unlinked Vector, a UV Map node, or Texture
+    Coordinate's UV output, through a Mapping node or not. Generated, Object
+    and the rest project the picture by position, which only a bake hands
+    over."""
+    vector = socket(node, "Vector")
+    for _ in range(3):
+        if vector is None or not vector.is_linked:
+            return True
+        link = vector.links[0]
+        source = link.from_node
+        if source.type == 'UVMAP':
+            return True
+        if source.type == 'TEX_COORD':
+            return link.from_socket.name == 'UV'
+        if source.type == 'MAPPING':
+            vector = socket(source, "Vector")
+            continue
+        return False
+    return False
+
+
+# ---- the surface, whatever shader makes it ----------------------------------
+
+PLAIN_SURFACE = {"base": (0.8, 0.8, 0.8), "roughness": 0.5, "metallic": 0.0, "normal": None,
+                 "emission": (0.0, 0.0, 0.0), "strength": 0.0, "transmission": 0.0, "ior": 1.45}
+
+
+def is_socket(value):
+    return hasattr(value, "is_linked")
+
+
+def number_of(value, fallback):
+    """A number from a socket or a plain value; a linked socket counts as
+    its default, which is what the graph started from."""
+    if is_socket(value):
+        value = value.default_value
+    try:
+        return float(value)
+    except TypeError:
+        return fallback
+
+
+def colour_of(value, fallback):
+    if is_socket(value):
+        value = value.default_value
+    try:
+        return tuple(float(c) for c in value)[:3]
+    except TypeError:
+        return fallback
+
+
+def output_shader(material):
+    """The node wired into the active Material Output's Surface, or None."""
+    if material is None or not getattr(material, "use_nodes", True) or material.node_tree is None:
+        return None
+    output = None
+    for node in material.node_tree.nodes:
+        if node.type == 'OUTPUT_MATERIAL' and (output is None or node.is_active_output):
+            output = node
+    surface = socket(output, "Surface") if output is not None else None
+    if surface is None or not surface.is_linked:
+        return None
+    return surface.links[0].from_node
+
+
+def shader_surface(node, depth=0):
+    """A shader node as what Frost's material is: sockets to follow (a
+    picture may be behind them) or plain values. The Principled BSDF as it
+    is; a Diffuse, Glossy or Metallic, Emission, Glass, Refraction,
+    Translucent or Transparent shader as the Principled it is nearest to; a
+    Mix or Add of shaders blended by the factor, with the sockets of the
+    heavier side; a group by what its output is wired to inside. Anything
+    else is grey -- which is what every material without a Principled was."""
+    surface = dict(PLAIN_SURFACE)
+    if node is None or depth > 5:
+        return surface
+    kind = node.type
+    if kind == 'REROUTE':
+        inp = node.inputs[0] if node.inputs else None
+        return shader_surface(inp.links[0].from_node if inp is not None and inp.is_linked else None, depth + 1)
+    if kind == 'BSDF_PRINCIPLED':
+        surface.update({"base": socket(node, "Base Color"), "roughness": socket(node, "Roughness"),
+                        "metallic": socket(node, "Metallic"), "normal": socket(node, "Normal"),
+                        "emission": socket(node, "Emission Color", "Emission"),
+                        "strength": socket(node, "Emission Strength"),
+                        "transmission": socket(node, "Transmission Weight", "Transmission"),
+                        "ior": socket(node, "IOR")})
+    elif kind == 'BSDF_DIFFUSE':
+        surface.update({"base": socket(node, "Color"), "roughness": 0.9, "normal": socket(node, "Normal")})
+    elif kind in ('BSDF_GLOSSY', 'BSDF_METALLIC'):
+        surface.update({"base": socket(node, "Color", "Base Color"), "metallic": 1.0,
+                        "roughness": socket(node, "Roughness"), "normal": socket(node, "Normal")})
+    elif kind == 'EMISSION':
+        surface.update({"base": (0.0, 0.0, 0.0), "emission": socket(node, "Color"),
+                        "strength": socket(node, "Strength")})
+    elif kind in ('BSDF_GLASS', 'BSDF_REFRACTION'):
+        surface.update({"base": socket(node, "Color"), "transmission": 1.0, "ior": socket(node, "IOR"),
+                        "roughness": socket(node, "Roughness"), "normal": socket(node, "Normal")})
+    elif kind == 'BSDF_TRANSPARENT':
+        surface.update({"base": socket(node, "Color"), "transmission": 1.0, "ior": 1.0, "roughness": 0.0})
+    elif kind in ('BSDF_TRANSLUCENT', 'SUBSURFACE_SCATTERING', 'BSDF_VELVET', 'BSDF_SHEEN', 'BSDF_TOON',
+                  'BSDF_HAIR', 'BSDF_HAIR_PRINCIPLED'):
+        surface.update({"base": socket(node, "Color"), "roughness": 0.9, "normal": socket(node, "Normal")})
+    elif kind in ('MIX_SHADER', 'ADD_SHADER'):
+        shaders = [s for s in node.inputs if s.type == 'SHADER']
+        parts = [shader_surface(s.links[0].from_node if s.is_linked else None, depth + 1) for s in shaders[:2]]
+        while len(parts) < 2:
+            parts.append(dict(PLAIN_SURFACE))
+        if kind == 'ADD_SHADER':
+            fac = 0.5
+        else:
+            fac_socket = node.inputs[0] if node.inputs and node.inputs[0].type != 'SHADER' else None
+            fac = 0.5 if fac_socket is None or fac_socket.is_linked else float(fac_socket.default_value)
+        return blend_surfaces(parts[0], parts[1], max(0.0, min(1.0, fac)))
+    elif kind == 'GROUP' and node.node_tree is not None:
+        for inner in node.node_tree.nodes:
+            if inner.type == 'GROUP_OUTPUT' and inner.is_active_output:
+                for inp in inner.inputs:
+                    if inp.type == 'SHADER' and inp.is_linked:
+                        return shader_surface(inp.links[0].from_node, depth + 1)
+    return surface
+
+
+def blend_surfaces(a, b, fac):
+    """Two surfaces as one: numbers blended by the factor, colours blended
+    when both are plain, the sockets of the heavier side otherwise, and the
+    emission of whichever glows."""
+    heavy = b if fac >= 0.5 else a
+    out = dict(heavy)
+    for key, fallback in (("roughness", 0.5), ("metallic", 0.0), ("transmission", 0.0), ("ior", 1.45)):
+        out[key] = number_of(a[key], fallback) * (1.0 - fac) + number_of(b[key], fallback) * fac
+    if not is_socket(a["base"]) and not is_socket(b["base"]):
+        ca, cb = colour_of(a["base"], (0.8, 0.8, 0.8)), colour_of(b["base"], (0.8, 0.8, 0.8))
+        out["base"] = tuple(ca[i] * (1.0 - fac) + cb[i] * fac for i in range(3))
+    glow_a = number_of(a["strength"], 0.0) * (1.0 - fac)
+    glow_b = number_of(b["strength"], 0.0) * fac
+    if glow_a > 0.0 or glow_b > 0.0:
+        glowing = a if glow_a >= glow_b else b
+        out["emission"] = glowing["emission"]
+        out["strength"] = glow_a + glow_b
+    return out
+
+
+def surface_of(material):
+    return shader_surface(output_shader(material))
+
+
+def readable(value):
+    """Whether Frost can take this as it is: a plain value, an unlinked
+    socket, or a socket with a picture behind it that Frost can follow."""
+    return not is_socket(value) or not value.is_linked or trace_image(value)[0] is not None
+
+
+def needs_bake(material):
+    """Whether the material's look reaches Frost only by baking: something
+    wired into its surface that is neither a value nor a picture Frost can
+    follow -- a procedural graph, a picture mapped by position."""
+    if material is None or output_shader(material) is None:
+        return False
+    surface = surface_of(material)
+    return not all(readable(surface[key]) for key in ("base", "roughness", "metallic", "normal", "emission"))
+
+
+def bake_record(obj):
+    """The object's bake, as a plain dict, or None."""
+    original = getattr(obj, "original", obj)
+    record = original.get(BAKE_KEY)
+    if record is None:
+        return None
+    try:
+        return record.to_dict()
+    except AttributeError:
+        return dict(record)
+
+
 def material_json(writer, material, overrides):
     """One glTF material, and what Frost's importer does not read -- the
     emission's strength, the glass -- into `overrides` by name."""
@@ -275,27 +483,28 @@ def material_json(writer, material, overrides):
     if material is None:
         return entry
     entry["doubleSided"] = not material.use_backface_culling
-    node = principled_of(material)
     pbr = entry["pbrMetallicRoughness"]
-    if node is None:
+    if output_shader(material) is None:
         colour = tuple(material.diffuse_color)
         pbr["baseColorFactor"] = [colour[0], colour[1], colour[2], 1.0]
         pbr["metallicFactor"] = float(material.metallic)
         pbr["roughnessFactor"] = float(material.roughness)
         return entry
+    surface = surface_of(material)
 
-    base = socket(node, "Base Color")
-    image, factor = trace_image(base)
+    base = surface["base"]
+    image, factor = trace_image(base) if is_socket(base) else (None, None)
     index = writer.image(image) if image is not None else None
     if index is not None:
         pbr["baseColorTexture"] = {"index": index}
         tint = factor if isinstance(factor, tuple) else (1.0, 1.0, 1.0)
         pbr["baseColorFactor"] = [float(tint[0]), float(tint[1]), float(tint[2]), 1.0]
     else:
-        colour = value_of(base, (0.8, 0.8, 0.8, 1.0))
-        pbr["baseColorFactor"] = [float(colour[0]), float(colour[1]), float(colour[2]), 1.0]
-    metal_image, metal_factor = trace_image(socket(node, "Metallic"))
-    rough_image, rough_factor = trace_image(socket(node, "Roughness"))
+        colour = colour_of(base, (0.8, 0.8, 0.8))
+        pbr["baseColorFactor"] = [colour[0], colour[1], colour[2], 1.0]
+    metal, rough = surface["metallic"], surface["roughness"]
+    metal_image, metal_factor = trace_image(metal) if is_socket(metal) else (None, None)
+    rough_image, rough_factor = trace_image(rough) if is_socket(rough) else (None, None)
     rough_index = writer.image(rough_image) if rough_image is not None else None
     if rough_index is not None and (metal_image is None or metal_image == rough_image):
         # glTF's packing, roughness in green and metalness in blue, which is
@@ -305,35 +514,36 @@ def material_json(writer, material, overrides):
         if metal_image is not None:
             pbr["metallicFactor"] = float(metal_factor) if isinstance(metal_factor, float) else 1.0
         else:
-            pbr["metallicFactor"] = float(value_of(socket(node, "Metallic"), 0.0))
+            pbr["metallicFactor"] = number_of(metal, 0.0)
     else:
-        pbr["metallicFactor"] = float(value_of(socket(node, "Metallic"), 0.0))
-        pbr["roughnessFactor"] = float(value_of(socket(node, "Roughness"), 0.5))
+        pbr["metallicFactor"] = number_of(metal, 0.0)
+        pbr["roughnessFactor"] = number_of(rough, 0.5)
 
-    normal_image = image_behind(socket(node, "Normal"))
+    normal = surface["normal"]
+    normal_image = image_behind(normal) if is_socket(normal) else None
     normal_index = writer.image(normal_image) if normal_image is not None else None
     if normal_index is not None:
         entry["normalTexture"] = {"index": normal_index}
 
-    emission = value_of(socket(node, "Emission Color", "Emission"), (0.0, 0.0, 0.0, 1.0))
-    strength = float(value_of(socket(node, "Emission Strength"), 0.0))
-    emission_image = image_behind(socket(node, "Emission Color", "Emission"))
+    emission = colour_of(surface["emission"], (0.0, 0.0, 0.0))
+    strength = number_of(surface["strength"], 0.0)
+    emission_image = image_behind(surface["emission"]) if is_socket(surface["emission"]) else None
     emission_index = writer.image(emission_image) if emission_image is not None else None
     if emission_index is not None:
         entry["emissiveTexture"] = {"index": emission_index}
-        emission = (1.0, 1.0, 1.0, 1.0)
+        emission = (1.0, 1.0, 1.0)
         strength = max(strength, 1.0)
-    if strength > 0.0 and max(emission[:3]) > 0.0:
-        entry["emissiveFactor"] = [min(float(c), 1.0) for c in emission[:3]]
+    if strength > 0.0 and max(emission) > 0.0:
+        entry["emissiveFactor"] = [min(float(c), 1.0) for c in emission]
         if strength != 1.0:
             entry.setdefault("extensions", {})["KHR_materials_emissive_strength"] = {"emissiveStrength": strength}
             writer.extensions_used.add("KHR_materials_emissive_strength")
         overrides.setdefault(material.name, {}).update(
-            {"emission": [float(c) for c in emission[:3]], "emission_strength": strength})
+            {"emission": [float(c) for c in emission], "emission_strength": strength})
 
-    transmission = float(value_of(socket(node, "Transmission Weight", "Transmission"), 0.0))
+    transmission = number_of(surface["transmission"], 0.0)
     if transmission > 0.0:
-        ior = float(value_of(socket(node, "IOR"), 1.45))
+        ior = number_of(surface["ior"], 1.45)
         entry.setdefault("extensions", {})["KHR_materials_transmission"] = {"transmissionFactor": transmission}
         entry["extensions"]["KHR_materials_ior"] = {"ior": ior}
         writer.extensions_used.update({"KHR_materials_transmission", "KHR_materials_ior"})
@@ -346,6 +556,53 @@ def material_slot(writer, material, overrides):
     if key not in writer.material_index:
         writer.materials.append(material_json(writer, material, overrides))
         writer.material_index[key] = len(writer.materials) - 1
+    return writer.material_index[key]
+
+
+def baked_material_slot(writer, material, entry, owner, overrides):
+    """A material as its bake: the pictures Bake Materials for Frost made
+    for it on this object, in the material's place, named for the object
+    since a bake is of the material on that object."""
+    key = "%s@%s" % (material.name if material else "default", owner)
+    if key in writer.material_index:
+        return writer.material_index[key]
+    result = {"name": key, "doubleSided": not material.use_backface_culling if material else True,
+              "pbrMetallicRoughness": {"baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+                                       "metallicFactor": float(entry.get("metallic", 0.0)),
+                                       "roughnessFactor": 1.0}}
+    pbr = result["pbrMetallicRoughness"]
+    index = writer.image_file(entry.get("color"))
+    if index is not None:
+        pbr["baseColorTexture"] = {"index": index}
+    index = writer.image_file(entry.get("roughness"))
+    if index is not None:
+        # The bake packs roughness in green and the metallic value in blue.
+        pbr["metallicRoughnessTexture"] = {"index": index}
+        pbr["metallicFactor"] = 1.0
+    else:
+        # A plain roughness was not baked; the material's own value stands.
+        pbr["roughnessFactor"] = float(entry.get("roughness_value", 0.5))
+    index = writer.image_file(entry.get("normal"))
+    if index is not None:
+        result["normalTexture"] = {"index": index}
+    strength = float(entry.get("emit_strength", 0.0))
+    index = writer.image_file(entry.get("emit")) if strength > 0.0 else None
+    if index is not None:
+        result["emissiveTexture"] = {"index": index}
+        result["emissiveFactor"] = [1.0, 1.0, 1.0]
+        if strength != 1.0:
+            result.setdefault("extensions", {})["KHR_materials_emissive_strength"] = {"emissiveStrength": strength}
+            writer.extensions_used.add("KHR_materials_emissive_strength")
+        overrides.setdefault(key, {}).update({"emission": [1.0, 1.0, 1.0], "emission_strength": strength})
+    transmission = float(entry.get("transmission", 0.0))
+    if transmission > 0.0:
+        ior = float(entry.get("ior", 1.45))
+        result.setdefault("extensions", {})["KHR_materials_transmission"] = {"transmissionFactor": transmission}
+        result["extensions"]["KHR_materials_ior"] = {"ior": ior}
+        writer.extensions_used.update({"KHR_materials_transmission", "KHR_materials_ior"})
+        overrides.setdefault(key, {}).update({"transmission": transmission, "ior": ior})
+    writer.materials.append(result)
+    writer.material_index[key] = len(writer.materials) - 1
     return writer.material_index[key]
 
 
@@ -366,6 +623,10 @@ def mesh_key(obj):
     its own evaluated mesh, and gets its own."""
     original = obj.original if hasattr(obj, "original") else obj
     if original.modifiers or obj.type != 'MESH':
+        return None
+    # A bake is of the material on that object, so a baked object's mesh is
+    # its own even when the data is shared.
+    if original.get(BAKE_KEY) is not None:
         return None
     data = original.data
     return data.name_full if data is not None else None
@@ -439,7 +700,11 @@ def add_mesh_data(writer, obj, overrides, name):
         mesh.loop_triangles.foreach_get("material_index", material_of)
         normals = np.empty(loop_count * 3, dtype=np.float32)
         mesh.corner_normals.foreach_get("vector", normals)
-        uv_layer = mesh.uv_layers.active
+        # A baked object reads its pictures by the bake's own UV map.
+        bake = bake_record(obj)
+        uv_layer = mesh.uv_layers.get(BAKE_UV) if bake is not None else None
+        if uv_layer is None:
+            uv_layer = mesh.uv_layers.active
         if uv_layer is not None:
             uvs = np.empty(loop_count * 2, dtype=np.float32)
             try:
@@ -494,7 +759,11 @@ def add_mesh_data(writer, obj, overrides, name):
             }
             slots = obj.material_slots
             material = slots[material_index].material if material_index < len(slots) else None
-            primitive["material"] = material_slot(writer, material, overrides)
+            baked = bake["materials"].get(str(material_index)) if bake is not None else None
+            if baked is not None and baked.get("color"):
+                primitive["material"] = baked_material_slot(writer, material, baked, obj.name, overrides)
+            else:
+                primitive["material"] = material_slot(writer, material, overrides)
             primitives.append(primitive)
         if not primitives:
             return None
