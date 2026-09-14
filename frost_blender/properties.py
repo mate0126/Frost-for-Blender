@@ -4,6 +4,8 @@
 import os
 import platform
 import shutil
+import stat
+import subprocess
 
 import bpy
 from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
@@ -41,6 +43,24 @@ def bundled_frost():
     return candidate if os.path.isfile(candidate) else ""
 
 
+def repair_executable(path):
+    """Blender installs an add-on zip with Python's zip reader, which keeps
+    no permission bits, so the executable arrives unable to run; and a zip
+    that came from a download leaves its quarantine flag on everything in
+    it. Both are put right here, on our own signed and notarised binary."""
+    try:
+        mode = os.stat(path).st_mode
+        if not mode & stat.S_IXUSR:
+            os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError:
+        pass
+    try:
+        subprocess.run(["xattr", "-d", "com.apple.quarantine", path], capture_output=True, check=False)
+    except OSError:
+        pass
+    return os.access(path, os.X_OK)
+
+
 def find_frost(preferences=None):
     """Where frost is: the preference if set, the bundled copy, the one
     FrioStudio installed into the Terminal, or the one inside the app."""
@@ -51,11 +71,14 @@ def find_frost(preferences=None):
     # A path in the environment wins over the search, for scripts and tests.
     if os.environ.get("FROST_PATH") and os.path.isfile(os.environ["FROST_PATH"]):
         return os.environ["FROST_PATH"]
-    for candidate in (bundled_frost(), shutil.which("frost") or "", "/usr/local/bin/frost",
+    bundled = bundled_frost()
+    if bundled and repair_executable(bundled):
+        return bundled
+    for candidate in (shutil.which("frost") or "", "/usr/local/bin/frost",
                       "/Applications/FrioStudio.app/Contents/MacOS/frost"):
-        if candidate and os.path.isfile(candidate):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-    return ""
+    return bundled
 
 
 def machine_is_apple_silicon():
@@ -75,10 +98,48 @@ class FrostPreferences(bpy.types.AddonPreferences):
         found = find_frost(self)
         if not machine_is_apple_silicon():
             layout.label(text="Frost runs on Apple silicon Macs only.", icon='ERROR')
-        elif found:
+        elif found and os.access(found, os.X_OK):
             layout.label(text="Using: " + found, icon='CHECKMARK')
+        elif found:
+            layout.label(text="Frost is here but cannot be run: " + found, icon='ERROR')
         else:
             layout.label(text="Frost was not found. Point this at the frost executable.", icon='ERROR')
+        row = layout.row()
+        row.operator("frost.repair", text="Repair the bundled frost", icon='FILE_REFRESH')
+        row.operator("frost.show_log", text="Show the last render's log", icon='TEXT')
+        layout.label(text="If a render shows nothing, the reason is in the render window's header and in the log.")
+
+
+class FROST_OT_repair(bpy.types.Operator):
+    bl_idname = "frost.repair"
+    bl_label = "Repair the bundled frost"
+    bl_description = "Makes the frost inside the add-on executable again and clears the download quarantine flag"
+
+    def execute(self, context):
+        path = bundled_frost()
+        if not path:
+            self.report({'ERROR'}, "This add-on has no frost inside it; set the path instead")
+            return {'CANCELLED'}
+        if repair_executable(path):
+            self.report({'INFO'}, "frost can run: " + path)
+            return {'FINISHED'}
+        self.report({'ERROR'}, "frost still cannot be run: " + path)
+        return {'CANCELLED'}
+
+
+class FROST_OT_show_log(bpy.types.Operator):
+    bl_idname = "frost.show_log"
+    bl_label = "Show the last render's log"
+    bl_description = "Opens the log Frost for Blender wrote for the last render"
+
+    def execute(self, context):
+        folder = os.path.join(os.path.expanduser("~"), "Library", "Logs", "Frost for Blender")
+        path = os.path.join(folder, "last-render.log")
+        if not os.path.isfile(path):
+            self.report({'INFO'}, "No render has been logged yet")
+            return {'CANCELLED'}
+        subprocess.run(["open", "-R", path], check=False)
+        return {'FINISHED'}
 
 
 def preferences(context=None):
@@ -87,7 +148,7 @@ def preferences(context=None):
     return addon.preferences if addon else None
 
 
-classes = (FrostSceneSettings, FrostPreferences)
+classes = (FrostSceneSettings, FrostPreferences, FROST_OT_repair, FROST_OT_show_log)
 
 
 def register():

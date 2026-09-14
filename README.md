@@ -25,6 +25,13 @@ frame comes back into Blender's render window.
 The add-on's preferences show which `frost` it found. Leave the path empty
 to use the copy inside the add-on; point it at another to use that one.
 
+If a render shows nothing, the reason is in the render window's header
+and in `~/Library/Logs/Frost for Blender/last-render.log`; the
+preferences have a button that opens it, and a **Repair** button that
+makes the bundled `frost` runnable again (Blender's installer keeps no
+permission bits when it unpacks a zip; the add-on repairs that on its
+own the first time it renders).
+
 ## What it renders
 
 - Every mesh (and curve, text and metaball, evaluated) with its modifiers
