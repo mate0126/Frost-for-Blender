@@ -31,6 +31,7 @@ class RENDER_PT_frost(bpy.types.Panel):
         row.prop(settings, "noise_threshold")
         layout.prop(settings, "filter_glossy")
         layout.prop(settings, "exposure")
+        layout.prop(settings, "viewport_scale")
 
         frost = properties.find_frost(properties.preferences(context))
         box = layout.box()

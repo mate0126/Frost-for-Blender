@@ -34,6 +34,10 @@ class FrostSceneSettings(bpy.types.PropertyGroup):
     exposure: FloatProperty(
         name="Exposure", default=1.0, min=0.01, max=100.0,
         description="Multiplies the picture before the tonemap")
+    viewport_scale: FloatProperty(
+        name="Viewport Scale", default=0.5, min=0.125, max=1.0,
+        description="The traced viewport's resolution as a fraction of the region: a half is four times "
+                    "fewer paths than full size and answers a move far sooner")
 
 
 def bundled_frost():

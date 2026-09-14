@@ -49,10 +49,20 @@ own the first time it renders).
 Frost's own rows are in Render Properties: samples, bounces, denoise,
 adaptive sampling with its noise threshold, filter glossy, and exposure.
 
+## The traced viewport
+
+Set the viewport's shading to **Rendered** and Frost traces it live, the
+way Frio's own viewport does: the picture clears as you watch, starts
+again as you orbit, and denoises as it goes. **Viewport Scale** in the
+Frost panel sets its resolution as a fraction of the region; a half is the
+default and answers a move four times sooner than full size. Orthographic
+views are not traced yet. The final render fills in bucket by bucket in
+the render window as it goes.
+
 ## What it does not do yet
 
-- The rendered viewport mode. The viewport draws with EEVEE or Solid; Frost
-  renders the final frame.
+- Orthographic viewports, and the camera frame's borders in camera view
+  (the traced view fills the region).
 - Animation and motion blur through the add-on. Frost itself does both;
   the add-on renders the current frame.
 - Volumes, hair, the Sky Texture world node, HDRI worlds, and shader node
