@@ -17,7 +17,7 @@ import struct
 
 import bpy
 import numpy as np
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 GLTF_FLOAT = 5126
 GLTF_UINT = 5125
@@ -125,33 +125,71 @@ def cache_folder():
     return folder
 
 
-def cached_image(image):
+def cached_image(image, hdr=False):
     """The image as a file in the cache, made once: a file-backed image is
     linked as it is, and a packed, painted or generated one is written as a
-    PNG named by its content's stamp. Returns the path, or None."""
+    PNG named by its content's stamp -- or as an EXR for a sky, whose sun is
+    thousands of times its ground and does not fit in a PNG. Returns the
+    path, or None."""
+    global last_image_error
     source = bpy.path.abspath(image.filepath_from_user()) if image.filepath else ""
     stem = bpy.path.clean_name(os.path.splitext(image.name)[0]) or "image"
-    if source and os.path.isfile(source) and not image.is_dirty and not image.packed_file:
+    # A sky is handed over as it is when it is a Radiance .hdr, which Frost
+    # reads; any other source -- an OpenEXR of whatever compression, a packed
+    # or painted picture -- is written out once by Blender as a plain OpenEXR,
+    # which Frost reads too. Not as an .hdr: Blender's Radiance writer goes
+    # through the view transform and a sun of six hundred came out as fifteen.
+    keep = source and os.path.isfile(source) and not image.is_dirty and not image.packed_file
+    if keep and (not hdr or source.lower().endswith(".hdr")):
         return source
     try:
         stamp = "%s-%dx%d-%s" % (image.name, image.size[0], image.size[1],
-                                 image.packed_file.size if image.packed_file else "painted")
+                                 image.packed_file.size if image.packed_file else
+                                 ("%d" % os.path.getmtime(source) if keep else "painted"))
     except Exception:
         stamp = image.name
     digest = hashlib.sha1(stamp.encode("utf-8", "replace")).hexdigest()[:12]
-    path = os.path.join(cache_folder(), "%s-%s.png" % (stem, digest))
+    path = os.path.join(cache_folder(), "%s-%s.%s" % (stem, digest, "exr" if hdr else "png"))
     if os.path.isfile(path) and not image.is_dirty:
+        return path
+    if hdr:
+        # Through a fresh float image, tagged linear, filled in bulk: a copy
+        # of a file-backed picture would not save under another name.
+        fresh = None
+        try:
+            w, h = int(image.size[0]), int(image.size[1])
+            pixels = np.empty(w * h * 4, dtype=np.float32)
+            image.pixels.foreach_get(pixels)
+            fresh = bpy.data.images.new("frost-sky", w, h, float_buffer=True, alpha=True)
+            try:
+                fresh.colorspace_settings.name = 'Linear Rec.709'
+            except TypeError:
+                pass
+            fresh.pixels.foreach_set(pixels)
+            fresh.filepath_raw = path
+            fresh.file_format = 'OPEN_EXR'
+            fresh.save()
+        except Exception as error:
+            last_image_error = str(error)
+            path = None
+        finally:
+            if fresh is not None:
+                bpy.data.images.remove(fresh)
         return path
     copy = image.copy()
     try:
         copy.filepath_raw = path
         copy.file_format = 'PNG'
         copy.save()
-    except Exception:
+    except Exception as error:
+        last_image_error = str(error)
         path = None
     finally:
         bpy.data.images.remove(copy)
     return path
+
+
+last_image_error = ""
 
 
 # ---- materials -------------------------------------------------------------
@@ -354,6 +392,27 @@ def add_mesh_instance(writer, obj, matrix, overrides, name):
     writer.add_node(name, mesh_number, matrix)
 
 
+def weld(keys):
+    """np.unique over the rows of an integer array, fast: each row hashed to
+    64 bits, the hashes made unique, and the answer checked against the rows
+    themselves -- two different rows sharing a hash, a one in ten million
+    chance at three million rows, falls back to the exact sort of the rows,
+    which is what np.unique(axis=0) does and is forty times slower (a
+    million-triangle mesh spent 1.3 of its 2 seconds in it). Returns
+    (first, inverse) as np.unique would."""
+    h = np.zeros(keys.shape[0], dtype=np.uint64)
+    with np.errstate(over='ignore'):
+        for column in range(keys.shape[1]):
+            h = h * np.uint64(0x9E3779B97F4A7C15) + keys[:, column].astype(np.uint64)
+            h ^= h >> np.uint64(29)
+    _, first, inverse = np.unique(h, return_index=True, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    if np.array_equal(keys[first][inverse], keys):
+        return first, inverse
+    _, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+    return first, inverse.reshape(-1)
+
+
 def add_mesh_data(writer, obj, overrides, name):
     """The evaluated mesh, in its own space. Returns the glTF mesh index."""
     try:
@@ -416,7 +475,7 @@ def add_mesh_data(writer, obj, overrides, name):
             keys[:, 0] = v
             keys[:, 1:4] = np.rint(world_normals[l] * 4096.0)
             keys[:, 4:6] = np.rint(uvs[l] * 65536.0)
-            unique_keys, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+            first, inverse = weld(keys)
             count = int(first.size)
             p = positions[v[first]].astype("<f4")
             n = world_normals[l[first]].astype("<f4")
@@ -536,23 +595,152 @@ def camera_json(depsgraph, scene, width, height, warnings):
     }
 
 
+# Blender's Sky Texture against Frio's atmosphere, measured: a grey plane
+# under the demo's sky rendered in Cycles and through Frost with the sun
+# mapped over, the plane's brightness with and without the sun disc, and
+# these are the ratios (tools/bench/nishita_calibrate.py): Cycles' plane
+# 6.25 with the sun and 1.76 without against Frost's 0.296 and 0.071.
+SUN_FROM_NISHITA = 19.9
+SKY_FROM_NISHITA = 24.9
+
+
+def mapping_turn(node):
+    """The turn about up of a Mapping node feeding an Environment Texture's
+    Vector, in radians; nought when there is none."""
+    vector = socket(node, "Vector")
+    if vector is None or not vector.is_linked:
+        return 0.0
+    mapping = vector.links[0].from_node
+    if mapping.type != 'MAPPING':
+        return 0.0
+    rotation = socket(mapping, "Rotation")
+    try:
+        return float(rotation.default_value[2]) if rotation is not None and not rotation.is_linked else 0.0
+    except (TypeError, IndexError):
+        return 0.0
+
+
+def atmosphere_json(node, strength):
+    """A Sky Texture node as Frio's atmosphere: the sun where the node puts
+    it, the air by the node's aerosol, the ground's height. Nishita's sun
+    direction is geographical_to_direction(elevation, rotation + pi/2)."""
+    if hasattr(node, "sun_elevation"):
+        elevation, rotation = float(node.sun_elevation), float(node.sun_rotation)
+        to_sun = Vector((math.cos(elevation) * math.cos(rotation + math.pi / 2.0),
+                         math.cos(elevation) * math.sin(rotation + math.pi / 2.0),
+                         math.sin(elevation)))
+        sun_strength = float(node.sun_intensity) if getattr(node, "sun_disc", True) else 0.0
+        angle = float(getattr(node, "sun_size", 0.0095))
+        altitude = float(getattr(node, "altitude", 0.0))
+        aerosol = float(getattr(node, "aerosol_density", getattr(node, "dust_density", 1.0)))
+    else:
+        # The older models: a direction and a turbidity.
+        to_sun = Vector(node.sun_direction).normalized()
+        sun_strength = 1.0
+        angle = 0.0095
+        altitude = 0.0
+        aerosol = float(getattr(node, "turbidity", 2.2)) / 2.2
+    preset = "dusty" if aerosol >= 5.0 else ("hazy" if aerosol >= 2.0 else "clear")
+    return {
+        "preset": preset,
+        "altitude": altitude,
+        "strength": strength * SKY_FROM_NISHITA,
+        "sun": {"direction": to_frost(-to_sun), "strength": strength * sun_strength * SUN_FROM_NISHITA,
+                "angle": angle},
+    }
+
+
 def world_json(scene, warnings):
+    """The world as (world, atmosphere): a colour at a strength or a picture
+    of the sky (Environment Texture) in the world block, and Blender's Sky
+    Texture as an atmosphere block beside it."""
     world = scene.world
     colour, strength = (0.05, 0.05, 0.05), 1.0
+    result = None
+    atmosphere = None
     if world is not None:
-        if world.use_nodes and world.node_tree is not None:
+        background = None
+        if getattr(world, "use_nodes", True) and world.node_tree is not None:
             for node in world.node_tree.nodes:
                 if node.type == 'BACKGROUND':
-                    colour_socket = socket(node, "Color")
-                    if colour_socket is not None and colour_socket.is_linked:
-                        warnings.append("The world's colour comes from a node Frost does not read; a plain grey stands in.")
-                    else:
-                        colour = tuple(value_of(colour_socket, (0.05, 0.05, 0.05, 1.0))[:3])
-                    strength = float(value_of(socket(node, "Strength"), 1.0))
+                    background = node
                     break
+        if background is not None:
+            strength = float(value_of(socket(background, "Strength"), 1.0))
+            colour_socket = socket(background, "Color")
+            source = colour_socket.links[0].from_node if colour_socket is not None and colour_socket.is_linked else None
+            if source is not None and source.type == 'TEX_SKY':
+                atmosphere = atmosphere_json(source, strength)
+            elif source is not None and source.type == 'TEX_ENVIRONMENT' and source.image is not None:
+                path = cached_image(source.image, hdr=True)
+                if path:
+                    result = {"image": path, "strength": strength, "rotation": mapping_turn(source)}
+                else:
+                    warnings.append("The world's picture could not be written out (%s); a plain grey stands in."
+                                    % (last_image_error or "no reason given"))
+            elif source is not None:
+                warnings.append("The world's colour comes from a %s node Frost does not read; a plain grey stands in."
+                                % source.type.replace('_', ' ').lower())
+            else:
+                colour = tuple(value_of(colour_socket, (0.05, 0.05, 0.05, 1.0))[:3])
         else:
             colour = tuple(world.color)
-    return {"color": [float(c) for c in colour], "strength": strength}
+    if result is None:
+        result = {"color": [float(c) for c in colour], "strength": strength}
+    return result, atmosphere
+
+
+# ---- volumes ---------------------------------------------------------------
+
+def volume_node_of(obj):
+    """The volume shader of a mesh whose every material is a volume and no
+    surface -- a box of fog -- or None. Such a mesh is air, not a wall."""
+    if obj.type != 'MESH' or not obj.material_slots:
+        return None
+    found = None
+    for slot in obj.material_slots:
+        material = slot.material
+        if material is None or not getattr(material, "use_nodes", True) or material.node_tree is None:
+            return None
+        output = None
+        for node in material.node_tree.nodes:
+            if node.type == 'OUTPUT_MATERIAL' and (output is None or node.is_active_output):
+                output = node
+        if output is None:
+            return None
+        surface, volume = socket(output, "Surface"), socket(output, "Volume")
+        if surface is None or volume is None or surface.is_linked or not volume.is_linked:
+            return None
+        node = volume.links[0].from_node
+        if node.type not in {'PRINCIPLED_VOLUME', 'VOLUME_SCATTER', 'VOLUME_ABSORPTION'}:
+            return None
+        found = node
+    return found
+
+
+def volume_json(obj, matrix, node, name):
+    """The box the mesh's bounds make, as a Frio domain: Frio's box is a unit
+    cube about the node, so the bounds' centre and size are folded into the
+    transform, which is then taken apart in Frost's axes."""
+    corners = [Vector(c) for c in obj.bound_box]
+    lo = Vector((min(c.x for c in corners), min(c.y for c in corners), min(c.z for c in corners)))
+    hi = Vector((max(c.x for c in corners), max(c.y for c in corners), max(c.z for c in corners)))
+    centre = (lo + hi) * 0.5
+    size = Vector((max(hi.x - lo.x, 1e-3), max(hi.y - lo.y, 1e-3), max(hi.z - lo.z, 1e-3)))
+    world = matrix @ Matrix.Translation(centre) @ Matrix.Diagonal(size).to_4x4()
+    location, rotation, scale = world.decompose()
+    turn = Matrix.Rotation(-math.pi / 2.0, 4, 'X').to_quaternion()
+    q = turn @ rotation @ turn.inverted()
+    colour = value_of(socket(node, "Color"), (1.0, 1.0, 1.0, 1.0))
+    return {
+        "name": name,
+        "translation": to_frost(location),
+        "rotation": [float(q.x), float(q.y), float(q.z), float(q.w)],
+        "scale": [float(scale.x), float(scale.z), float(scale.y)],
+        "density": float(value_of(socket(node, "Density"), 1.0)),
+        "color": [float(c) for c in colour[:3]],
+        "anisotropy": float(value_of(socket(node, "Anisotropy"), 0.0)),
+    }
 
 
 def lights_json(depsgraph, writer, overrides, warnings):
@@ -594,6 +782,7 @@ def export_scene(depsgraph, scene, out_dir, width, height, settings):
     writer = GltfWriter(out_dir)
     overrides = {}
     warnings = []
+    volumes = []
     for instance in depsgraph.object_instances:
         obj = instance.object
         if obj.type not in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}:
@@ -601,14 +790,22 @@ def export_scene(depsgraph, scene, out_dir, width, height, settings):
         if not instance.show_self and not instance.is_instance:
             continue
         name = obj.name if not instance.is_instance else "%s.%d" % (obj.name, instance.random_id)
+        # A box of fog is air, not a wall: written as a volume, never as a
+        # mesh. Sent as a mesh it enclosed the whole scene in an opaque box
+        # and every frame of the sky demo came out black.
+        volume = volume_node_of(obj)
+        if volume is not None:
+            volumes.append(volume_json(obj, instance.matrix_world.copy(), volume, name))
+            continue
         add_mesh_instance(writer, obj, instance.matrix_world.copy(), overrides, name)
     sun, lights = lights_json(depsgraph, writer, overrides, warnings)
     gltf = writer.write("scene")
     warnings.extend(writer.warnings)
 
+    world, atmosphere = world_json(scene, warnings)
     setup = {
         "camera": camera_json(depsgraph, scene, width, height, warnings),
-        "world": world_json(scene, warnings),
+        "world": world,
         "lights": lights,
         "materials": overrides,
         "render": {
@@ -622,6 +819,10 @@ def export_scene(depsgraph, scene, out_dir, width, height, settings):
     }
     if sun is not None:
         setup["sun"] = sun
+    if atmosphere is not None:
+        setup["atmosphere"] = atmosphere
+    if volumes:
+        setup["volumes"] = volumes
     if setup["camera"] is None:
         del setup["camera"]
     setup_path = os.path.join(out_dir, "setup.json")

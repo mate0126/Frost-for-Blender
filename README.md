@@ -43,7 +43,16 @@ own the first time it renders).
   exactly, factors and packed maps included.
 - Lights: one sun, point lights, spot lights, and area lights (rendered as
   the emissive surfaces they are, at the power you set).
-- The world's colour and strength.
+- The world, in its three forms: a colour at a strength; an **HDRI** (an
+  Environment Texture, turned by a Mapping node's Z rotation), which lights
+  the scene and stands behind it, with the sun in the picture found by
+  Frost's light sampling so it casts real shadows; and the **Sky Texture**
+  (Nishita), which becomes Frost's own physical atmosphere with the sun
+  where the node puts it, the air by the node's aerosol, the ground's
+  altitude, and the strengths calibrated against Cycles on the same scene.
+- **Boxes of fog**: a mesh whose material is a Principled Volume (or a
+  Volume Scatter) and no surface becomes a volume in Frost -- an even fog in
+  the box at the node's density, colour and anisotropy -- rather than a wall.
 - The camera: focal length, sensor, clipping, and depth of field when it is
   on.
 
@@ -66,9 +75,11 @@ the render window as it goes.
   (the traced view fills the region).
 - Animation and motion blur through the add-on. Frost itself does both;
   the add-on renders the current frame.
-- Volumes, hair, the Sky Texture world node, HDRI worlds, and shader node
-  trees beyond the Principled BSDF and image textures. A material Frost
-  cannot read renders with the values on its Principled sockets.
+- Smoke and fire simulations, hair, and shader node trees beyond the
+  Principled BSDF and image textures: a procedural material (noise, ramps,
+  mixes) renders with the values on its Principled sockets, and a world
+  built from nodes other than a colour, an Environment Texture or a Sky
+  Texture renders under a plain grey and says so in the log.
 - Passes other than Combined.
 
 ## The view transform
