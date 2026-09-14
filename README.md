@@ -35,7 +35,8 @@ own the first time it renders).
 ## What it renders
 
 - Every mesh (and curve, text and metaball, evaluated) with its modifiers
-  applied, instances included.
+  applied, instances included. A scene of a few million triangles is
+  handed over in a few seconds; copies of one mesh are sent once.
 - Materials through the Principled BSDF: base colour, metallic, roughness
   (as values or image textures), normal maps, emission with its strength,
   and transmission with its IOR. Files imported from glTF come through

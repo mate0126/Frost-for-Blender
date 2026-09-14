@@ -8,6 +8,7 @@
 # exporter does the same, which is why a file it writes and a file this
 # writes agree.
 
+import hashlib
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import shutil
 import struct
 
 import bpy
+import numpy as np
 from mathutils import Vector
 
 GLTF_FLOAT = 5126
@@ -36,6 +38,7 @@ class GltfWriter:
         self.accessors = []
         self.buffer_views = []
         self.meshes = []
+        self.mesh_index = {}
         self.nodes = []
         self.materials = []
         self.material_index = {}
@@ -58,28 +61,33 @@ class GltfWriter:
         self.accessors.append(accessor)
         return len(self.accessors) - 1
 
+    def add_node(self, name, mesh_number, matrix):
+        """A node showing a mesh, with Blender's world matrix turned into
+        glTF's axes; glTF wants the sixteen numbers column by column."""
+        world = np.array(matrix, dtype=np.float64)
+        turned = AXIS_CHANGE @ world @ AXIS_CHANGE_INVERSE
+        self.nodes.append({"name": name, "mesh": mesh_number, "matrix": turned.T.reshape(-1).tolist()})
+
     def image(self, image):
-        """Writes an image beside the glTF and returns its texture index."""
+        """Writes an image beside the glTF and returns its texture index. The
+        file is linked from a cache, not copied: a project's textures are
+        gigabytes, and the viewport exports the scene again on every change."""
         key = image.name
         if key in self.image_index:
             return self.image_index[key]
         folder = os.path.join(self.out_dir, "textures")
         os.makedirs(folder, exist_ok=True)
-        source = bpy.path.abspath(image.filepath_from_user()) if image.filepath else ""
-        stem = bpy.path.clean_name(os.path.splitext(image.name)[0]) or "image"
-        if source and os.path.isfile(source) and not image.is_dirty:
-            name = stem + os.path.splitext(source)[1].lower()
-            shutil.copyfile(source, os.path.join(folder, name))
-        else:
-            # Packed, painted or generated: written out as a PNG.
-            name = stem + ".png"
-            copy = image.copy()
+        cached = cached_image(image)
+        if cached is None:
+            self.warnings.append("The image %s could not be written out; its material renders without it." % image.name)
+            return None
+        name = os.path.basename(cached)
+        target = os.path.join(folder, name)
+        if not os.path.exists(target):
             try:
-                copy.filepath_raw = os.path.join(folder, name)
-                copy.file_format = 'PNG'
-                copy.save()
-            finally:
-                bpy.data.images.remove(copy)
+                os.symlink(cached, target)
+            except OSError:
+                shutil.copyfile(cached, target)
         self.images.append({"uri": "textures/" + name})
         self.textures.append({"source": len(self.images) - 1, "sampler": 0})
         self.image_index[key] = len(self.textures) - 1
@@ -109,6 +117,41 @@ class GltfWriter:
         with open(path, "w") as f:
             json.dump(document, f)
         return path
+
+
+def cache_folder():
+    folder = os.path.join(os.path.expanduser("~"), "Library", "Caches", "Frost for Blender", "textures")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def cached_image(image):
+    """The image as a file in the cache, made once: a file-backed image is
+    linked as it is, and a packed, painted or generated one is written as a
+    PNG named by its content's stamp. Returns the path, or None."""
+    source = bpy.path.abspath(image.filepath_from_user()) if image.filepath else ""
+    stem = bpy.path.clean_name(os.path.splitext(image.name)[0]) or "image"
+    if source and os.path.isfile(source) and not image.is_dirty and not image.packed_file:
+        return source
+    try:
+        stamp = "%s-%dx%d-%s" % (image.name, image.size[0], image.size[1],
+                                 image.packed_file.size if image.packed_file else "painted")
+    except Exception:
+        stamp = image.name
+    digest = hashlib.sha1(stamp.encode("utf-8", "replace")).hexdigest()[:12]
+    path = os.path.join(cache_folder(), "%s-%s.png" % (stem, digest))
+    if os.path.isfile(path) and not image.is_dirty:
+        return path
+    copy = image.copy()
+    try:
+        copy.filepath_raw = path
+        copy.file_format = 'PNG'
+        copy.save()
+    except Exception:
+        path = None
+    finally:
+        bpy.data.images.remove(copy)
+    return path
 
 
 # ---- materials -------------------------------------------------------------
@@ -205,8 +248,9 @@ def material_json(writer, material, overrides):
 
     base = socket(node, "Base Color")
     image, factor = trace_image(base)
-    if image is not None:
-        pbr["baseColorTexture"] = {"index": writer.image(image)}
+    index = writer.image(image) if image is not None else None
+    if index is not None:
+        pbr["baseColorTexture"] = {"index": index}
         tint = factor if isinstance(factor, tuple) else (1.0, 1.0, 1.0)
         pbr["baseColorFactor"] = [float(tint[0]), float(tint[1]), float(tint[2]), 1.0]
     else:
@@ -214,10 +258,11 @@ def material_json(writer, material, overrides):
         pbr["baseColorFactor"] = [float(colour[0]), float(colour[1]), float(colour[2]), 1.0]
     metal_image, metal_factor = trace_image(socket(node, "Metallic"))
     rough_image, rough_factor = trace_image(socket(node, "Roughness"))
-    if rough_image is not None and (metal_image is None or metal_image == rough_image):
+    rough_index = writer.image(rough_image) if rough_image is not None else None
+    if rough_index is not None and (metal_image is None or metal_image == rough_image):
         # glTF's packing, roughness in green and metalness in blue, which is
         # what the importer split and what the exporter joins again.
-        pbr["metallicRoughnessTexture"] = {"index": writer.image(rough_image)}
+        pbr["metallicRoughnessTexture"] = {"index": rough_index}
         pbr["roughnessFactor"] = float(rough_factor) if isinstance(rough_factor, float) else 1.0
         if metal_image is not None:
             pbr["metallicFactor"] = float(metal_factor) if isinstance(metal_factor, float) else 1.0
@@ -228,14 +273,16 @@ def material_json(writer, material, overrides):
         pbr["roughnessFactor"] = float(value_of(socket(node, "Roughness"), 0.5))
 
     normal_image = image_behind(socket(node, "Normal"))
-    if normal_image is not None:
-        entry["normalTexture"] = {"index": writer.image(normal_image)}
+    normal_index = writer.image(normal_image) if normal_image is not None else None
+    if normal_index is not None:
+        entry["normalTexture"] = {"index": normal_index}
 
     emission = value_of(socket(node, "Emission Color", "Emission"), (0.0, 0.0, 0.0, 1.0))
     strength = float(value_of(socket(node, "Emission Strength"), 0.0))
     emission_image = image_behind(socket(node, "Emission Color", "Emission"))
-    if emission_image is not None:
-        entry["emissiveTexture"] = {"index": writer.image(emission_image)}
+    emission_index = writer.image(emission_image) if emission_image is not None else None
+    if emission_index is not None:
+        entry["emissiveTexture"] = {"index": emission_index}
         emission = (1.0, 1.0, 1.0, 1.0)
         strength = max(strength, 1.0)
     if strength > 0.0 and max(emission[:3]) > 0.0:
@@ -266,61 +313,123 @@ def material_slot(writer, material, overrides):
 
 # ---- meshes ----------------------------------------------------------------
 
+# Blender's z-up into glTF's y-up, as a change of basis: a node's matrix is
+# C M C^-1, a position is C p.
+AXIS_CHANGE = np.array([[1.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, -1.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0]])
+AXIS_CHANGE_INVERSE = np.linalg.inv(AXIS_CHANGE)
+
+
+def mesh_key(obj):
+    """What decides whether two instances can share one exported mesh: the
+    same mesh data and no modifiers of its own. An object with modifiers is
+    its own evaluated mesh, and gets its own."""
+    original = obj.original if hasattr(obj, "original") else obj
+    if original.modifiers or obj.type != 'MESH':
+        return None
+    data = original.data
+    return data.name_full if data is not None else None
+
+
 def add_mesh_instance(writer, obj, matrix, overrides, name):
-    """The evaluated mesh of one instance, in world space, one primitive per
-    material. Every triangle corner is its own vertex, which keeps the
-    corner normals and needs no welding."""
+    """One node for this instance, carrying its matrix, and the mesh it
+    shows: written once per mesh data (a thousand copies of a stone are one
+    mesh and a thousand nodes, which is what Frost's importer keeps them
+    as, and a thousandth of the file), in the mesh's own space, one
+    primitive per material, corners welded. Everything comes out of
+    Blender in bulk (`foreach_get`) and is turned with numpy: a million
+    triangles take a third of a second, where a loop over every corner in
+    Python took minutes with Blender frozen for the whole of it."""
+    key = mesh_key(obj)
+    if key is not None and key in writer.mesh_index:
+        writer.add_node(name, writer.mesh_index[key], matrix)
+        return
+    mesh_number = add_mesh_data(writer, obj, overrides, name)
+    if mesh_number is None:
+        return
+    if key is not None:
+        writer.mesh_index[key] = mesh_number
+    writer.add_node(name, mesh_number, matrix)
+
+
+def add_mesh_data(writer, obj, overrides, name):
+    """The evaluated mesh, in its own space. Returns the glTF mesh index."""
     try:
         mesh = obj.to_mesh()
     except RuntimeError:
-        return
+        return None
     if mesh is None or len(mesh.polygons) == 0:
         obj.to_mesh_clear()
-        return
+        return None
     try:
         mesh.calc_loop_triangles()
-        corner_normals = mesh.corner_normals
+        triangle_count = len(mesh.loop_triangles)
+        if triangle_count == 0:
+            return None
+        vertex_count = len(mesh.vertices)
+        loop_count = len(mesh.loops)
+        co = np.empty(vertex_count * 3, dtype=np.float32)
+        mesh.vertices.foreach_get("co", co)
+        triangle_vertices = np.empty(triangle_count * 3, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("vertices", triangle_vertices)
+        triangle_loops = np.empty(triangle_count * 3, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("loops", triangle_loops)
+        material_of = np.empty(triangle_count, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("material_index", material_of)
+        normals = np.empty(loop_count * 3, dtype=np.float32)
+        mesh.corner_normals.foreach_get("vector", normals)
         uv_layer = mesh.uv_layers.active
-        uvs = uv_layer.data if uv_layer is not None else None
-        normal_matrix = matrix.to_3x3().inverted_safe().transposed()
-        vertices = mesh.vertices
+        if uv_layer is not None:
+            uvs = np.empty(loop_count * 2, dtype=np.float32)
+            try:
+                uv_layer.uv.foreach_get("vector", uvs)
+            except AttributeError:
+                uv_layer.data.foreach_get("uv", uvs)
+            uvs = uvs.reshape(loop_count, 2)
+            uvs[:, 1] = 1.0 - uvs[:, 1]   # glTF's picture origin is the top left
+        else:
+            uvs = np.zeros((loop_count, 2), dtype=np.float32)
 
-        by_material = {}
-        for triangle in mesh.loop_triangles:
-            by_material.setdefault(triangle.material_index, []).append(triangle)
+        # In the mesh's own space, into Frost's axes: (x, y, z) -> (x, z, -y).
+        positions = co.reshape(vertex_count, 3).astype(np.float64)
+        world_normals = normals.reshape(loop_count, 3).astype(np.float64)
+        positions = positions[:, [0, 2, 1]] * np.array([1.0, 1.0, -1.0])
+        world_normals = world_normals[:, [0, 2, 1]] * np.array([1.0, 1.0, -1.0])
 
+        corner_vertices = triangle_vertices.reshape(triangle_count, 3)
+        corner_loops = triangle_loops.reshape(triangle_count, 3)
         primitives = []
-        for material_index, triangles in by_material.items():
-            positions, normals, texcoords = [], [], []
-            low = [1e30, 1e30, 1e30]
-            high = [-1e30, -1e30, -1e30]
-            for triangle in triangles:
-                for loop_index, vertex_index in zip(triangle.loops, triangle.vertices):
-                    p = to_frost(matrix @ vertices[vertex_index].co)
-                    n = to_frost((normal_matrix @ corner_normals[loop_index].vector).normalized())
-                    positions.extend(p)
-                    normals.extend(n)
-                    for axis in range(3):
-                        low[axis] = min(low[axis], p[axis])
-                        high[axis] = max(high[axis], p[axis])
-                    if uvs is not None:
-                        uv = uvs[loop_index].uv
-                        texcoords.extend((float(uv.x), 1.0 - float(uv.y)))
-                    else:
-                        texcoords.extend((0.0, 0.0))
-            count = len(positions) // 3
-            if count == 0:
+        for material_index in np.unique(material_of):
+            chosen = material_of == material_index
+            v = corner_vertices[chosen].reshape(-1)
+            l = corner_loops[chosen].reshape(-1)
+            if v.size == 0:
                 continue
+            # Corners welded: a smooth surface's corners share their vertex,
+            # normal and uv with their neighbours, and a vertex for each of
+            # them was three times the file and three times the import. The
+            # key is the vertex with its normal and uv rounded to what a
+            # half-float would keep.
+            keys = np.empty((v.size, 6), dtype=np.int64)
+            keys[:, 0] = v
+            keys[:, 1:4] = np.rint(world_normals[l] * 4096.0)
+            keys[:, 4:6] = np.rint(uvs[l] * 65536.0)
+            unique_keys, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+            count = int(first.size)
+            p = positions[v[first]].astype("<f4")
+            n = world_normals[l[first]].astype("<f4")
+            t = uvs[l[first]].astype("<f4")
+            low = p.min(axis=0).tolist()
+            high = p.max(axis=0).tolist()
             primitive = {
                 "attributes": {
-                    "POSITION": writer.accessor(struct.pack("<%df" % len(positions), *positions), count,
-                                                GLTF_FLOAT, "VEC3", ARRAY_BUFFER, (low, high)),
-                    "NORMAL": writer.accessor(struct.pack("<%df" % len(normals), *normals), count,
-                                              GLTF_FLOAT, "VEC3", ARRAY_BUFFER),
-                    "TEXCOORD_0": writer.accessor(struct.pack("<%df" % len(texcoords), *texcoords), count,
-                                                  GLTF_FLOAT, "VEC2", ARRAY_BUFFER),
+                    "POSITION": writer.accessor(p.tobytes(), count, GLTF_FLOAT, "VEC3", ARRAY_BUFFER, (low, high)),
+                    "NORMAL": writer.accessor(n.tobytes(), count, GLTF_FLOAT, "VEC3", ARRAY_BUFFER),
+                    "TEXCOORD_0": writer.accessor(t.tobytes(), count, GLTF_FLOAT, "VEC2", ARRAY_BUFFER),
                 },
-                "indices": writer.accessor(struct.pack("<%dI" % count, *range(count)), count,
+                "indices": writer.accessor(inverse.reshape(-1).astype("<u4").tobytes(), int(inverse.size),
                                            GLTF_UINT, "SCALAR", ELEMENT_ARRAY_BUFFER),
                 "mode": 4,
             }
@@ -328,9 +437,10 @@ def add_mesh_instance(writer, obj, matrix, overrides, name):
             material = slots[material_index].material if material_index < len(slots) else None
             primitive["material"] = material_slot(writer, material, overrides)
             primitives.append(primitive)
-        if primitives:
-            writer.meshes.append({"name": name, "primitives": primitives})
-            writer.nodes.append({"name": name, "mesh": len(writer.meshes) - 1})
+        if not primitives:
+            return None
+        writer.meshes.append({"name": name, "primitives": primitives})
+        return len(writer.meshes) - 1
     finally:
         obj.to_mesh_clear()
 

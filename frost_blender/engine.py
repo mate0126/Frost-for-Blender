@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 import weakref
 
@@ -74,6 +75,7 @@ class FrostRenderEngine(bpy.types.RenderEngine):
         super().__init__(*args, **kwargs)
         self.session = None
         self.drawing = None
+        self.restart_due = None
 
     def __del__(self):
         session = getattr(self, "session", None)
@@ -86,21 +88,37 @@ class FrostRenderEngine(bpy.types.RenderEngine):
     # ---- the traced viewport ----------------------------------------------
 
     def view_update(self, context, depsgraph):
-        """The scene changed, or the viewport just went to Rendered: write
-        the scene out and start (or restart) the frost session."""
+        """The scene changed, or the viewport just went to Rendered. The
+        first time, the scene is written out and the frost session started
+        here and now; a later change only asks for a restart, which the
+        timer makes a moment after the last change in a run of them -- a
+        drag is dozens of updates a second, and an export for each was a
+        viewport that stuttered for the length of the drag."""
         from . import viewport
-        restart = self.session is None or not self.session.alive()
-        if not restart:
-            for update in depsgraph.updates:
-                if update.is_updated_geometry or update.is_updated_transform or update.is_updated_shading:
-                    if not isinstance(update.id, (bpy.types.Scene, bpy.types.Screen, bpy.types.WindowManager)):
-                        restart = True
-                        break
-        if not restart:
+        if self.session is None or not self.session.alive():
+            self.session = viewport.start_session(self, context, depsgraph)
+            if self.session is not None:
+                try:
+                    reference = weakref.ref(self)
+                except TypeError:
+                    reference = lambda engine=self: engine
+                viewport.redraw_when_frames_arrive(reference, self.session)
+            self.tag_redraw()
             return
-        if self.session is not None:
-            self.session.close()
-        self.session = viewport.start_session(self, context, depsgraph)
+        for update in depsgraph.updates:
+            if update.is_updated_geometry or update.is_updated_transform or update.is_updated_shading:
+                if not isinstance(update.id, (bpy.types.Scene, bpy.types.Screen, bpy.types.WindowManager)):
+                    self.restart_due = time.time() + 0.3
+                    break
+
+    def restart_session(self):
+        """Called by the timer once a run of changes has gone quiet."""
+        from . import viewport
+        self.restart_due = None
+        old = self.session
+        self.session = viewport.start_session(self, bpy.context, bpy.context.evaluated_depsgraph_get())
+        if old is not None:
+            old.close()
         if self.session is not None:
             try:
                 reference = weakref.ref(self)
@@ -199,6 +217,8 @@ class FrostRenderEngine(bpy.types.RenderEngine):
                 for line in process.stdout:
                     tail.append(line.rstrip())
                     tail = tail[-20:]
+                    if line.startswith("snapshot final"):
+                        continue
                     match = snapshot.match(line)
                     if match:
                         done, count = int(match.group(1)), int(match.group(2))
@@ -230,18 +250,21 @@ class FrostRenderEngine(bpy.types.RenderEngine):
             if process.returncode != 0 or not os.path.isfile(out):
                 raise RuntimeError("frost did not render: " + (" / ".join(tail[-3:]) or "no output"))
 
-            # Blender's render result loads EXR files and nothing else, so the
-            # frame is decoded here and handed to the Combined pass as
-            # scene-linear floats, rows from the bottom as Blender keeps them.
+            # Blender's render result loads EXR files and nothing else. The
+            # finished frame is in the progress file, denoised and through the
+            # lens, read the same cheap way as the snapshots; the PNG is decoded
+            # only if that is somehow not there.
             self.update_stats("Frost", "Loading the frame")
-            frame_width, frame_height, rgb = png.read_png(out)
-            if (frame_width, frame_height) != (width, height):
-                raise RuntimeError("frost's frame is %dx%d, not %dx%d" % (frame_width, frame_height, width, height))
-            linear = png.srgb_to_linear(rgb[::-1])
-            rgba = np.concatenate([linear, np.ones((height, width, 1), dtype=np.float32)], axis=2)
+            pixels = read_snapshot(snapshot_path, width, height)
+            if pixels is None:
+                frame_width, frame_height, rgb = png.read_png(out)
+                if (frame_width, frame_height) != (width, height):
+                    raise RuntimeError("frost's frame is %dx%d, not %dx%d" % (frame_width, frame_height, width, height))
+                linear = png.srgb_to_linear(rgb[::-1])
+                pixels = np.concatenate([linear, np.ones((height, width, 1), dtype=np.float32)], axis=2).reshape(-1)
             final = self.begin_result(0, 0, width, height)
             try:
-                final.layers[0].passes["Combined"].rect.foreach_set(rgba.reshape(-1).astype(np.float32))
+                final.layers[0].passes["Combined"].rect.foreach_set(pixels.astype(np.float32))
             finally:
                 self.end_result(final)
             self.update_progress(1.0)

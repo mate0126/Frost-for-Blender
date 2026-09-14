@@ -11,7 +11,7 @@
 bl_info = {
     "name": "Frost Render Engine",
     "author": "Mate Szollos",
-    "version": (1, 1, 0),
+    "version": (1, 1, 1),
     "blender": (4, 2, 0),
     "location": "Render Properties > Render Engine > Frost",
     "description": "Render with Frost, FrioStudio's path tracer, on Apple silicon Macs",

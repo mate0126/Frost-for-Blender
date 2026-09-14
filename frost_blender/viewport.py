@@ -99,8 +99,10 @@ class Session:
                         self.process.stdin.flush()
                     except (OSError, ValueError):
                         pass
+                    # frost leaves between two passes, within a few
+                    # hundredths of a second; nobody waits longer for it.
                     try:
-                        self.process.wait(timeout=1.0)
+                        self.process.wait(timeout=0.2)
                     except subprocess.TimeoutExpired:
                         self.process.kill()
                         self.process.wait()
@@ -181,6 +183,12 @@ def redraw_when_frames_arrive(engine_ref, session):
     def poll():
         engine = engine_ref()
         if engine is None or session.process is None:
+            return None
+        if engine.session is not session:
+            return None   # a newer session has its own timer
+        due = getattr(engine, "restart_due", None)
+        if due is not None and time.time() >= due:
+            engine.restart_session()
             return None
         try:
             mtime = os.path.getmtime(session.frame_path)
