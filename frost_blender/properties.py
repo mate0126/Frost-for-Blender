@@ -1,0 +1,102 @@
+# The render settings Frost has rows for, kept on the scene so they save
+# with the file, and the add-on's own preference: where frost is.
+
+import os
+import platform
+import shutil
+
+import bpy
+from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+
+
+class FrostSceneSettings(bpy.types.PropertyGroup):
+    samples: IntProperty(
+        name="Samples", default=128, min=1, max=16384,
+        description="Paths per pixel. With adaptive sampling on, the most any bucket takes")
+    bounces: IntProperty(
+        name="Bounces", default=6, min=1, max=32,
+        description="How many times a path may bounce; 1 is direct light only")
+    denoise: BoolProperty(
+        name="Denoise", default=True,
+        description="Filter the grain out of the finished frame, guided by what each pixel is looking at")
+    adaptive: BoolProperty(
+        name="Adaptive Sampling", default=True,
+        description="A bucket stops once its pixels have settled to within the noise threshold")
+    noise_threshold: FloatProperty(
+        name="Noise Threshold", default=0.01, min=0.001, max=0.5, precision=3,
+        description="The relative error a bucket may stop at. 0.01 is a clean frame; 0.05 is a preview")
+    filter_glossy: FloatProperty(
+        name="Filter Glossy", default=1.0, min=0.0, max=10.0,
+        description="A glossy surface seen off a matt one is shaded a little rougher, so a highlight "
+                    "bouncing onto a floor is a soft glow rather than specks. 1 matches Blender; 0 is exact")
+    exposure: FloatProperty(
+        name="Exposure", default=1.0, min=0.01, max=100.0,
+        description="Multiplies the picture before the tonemap")
+
+
+def bundled_frost():
+    """The frost executable that ships inside the add-on, if it does."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(here, "bin", "frost")
+    return candidate if os.path.isfile(candidate) else ""
+
+
+def find_frost(preferences=None):
+    """Where frost is: the preference if set, the bundled copy, the one
+    FrioStudio installed into the Terminal, or the one inside the app."""
+    if preferences is not None and preferences.frost_path:
+        path = bpy.path.abspath(preferences.frost_path)
+        if os.path.isfile(path):
+            return path
+    # A path in the environment wins over the search, for scripts and tests.
+    if os.environ.get("FROST_PATH") and os.path.isfile(os.environ["FROST_PATH"]):
+        return os.environ["FROST_PATH"]
+    for candidate in (bundled_frost(), shutil.which("frost") or "", "/usr/local/bin/frost",
+                      "/Applications/FrioStudio.app/Contents/MacOS/frost"):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def machine_is_apple_silicon():
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
+class FrostPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    frost_path: StringProperty(
+        name="Frost executable", subtype='FILE_PATH', default="",
+        description="Leave empty to use the copy inside the add-on, or the one FrioStudio installed")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "frost_path")
+        found = find_frost(self)
+        if not machine_is_apple_silicon():
+            layout.label(text="Frost runs on Apple silicon Macs only.", icon='ERROR')
+        elif found:
+            layout.label(text="Using: " + found, icon='CHECKMARK')
+        else:
+            layout.label(text="Frost was not found. Point this at the frost executable.", icon='ERROR')
+
+
+def preferences(context=None):
+    context = context or bpy.context
+    addon = context.preferences.addons.get(__package__)
+    return addon.preferences if addon else None
+
+
+classes = (FrostSceneSettings, FrostPreferences)
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.frost = PointerProperty(type=FrostSceneSettings)
+
+
+def unregister():
+    del bpy.types.Scene.frost
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
