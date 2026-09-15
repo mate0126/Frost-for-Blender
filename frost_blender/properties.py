@@ -41,6 +41,10 @@ class FrostSceneSettings(bpy.types.PropertyGroup):
                ('2048', "2048", "A hero object, or the ground"), ('4096', "4096", "Slow; a whole vehicle")),
         default='1024',
     )
+    auto_bake: BoolProperty(
+        name="Bake Before Rendering", default=True,
+        description="F12 first bakes whatever Frost cannot read as it is -- procedural materials, pictures "
+                    "mapped by position, the world -- once each, and renders with the bakes")
     viewport_scale: FloatProperty(
         name="Viewport Scale", default=0.5, min=0.125, max=1.0,
         description="The traced viewport's resolution as a fraction of the region: a half is four times "

@@ -21,6 +21,7 @@ class RENDER_PT_frost(bpy.types.Panel):
         layout = self.layout
         layout.use_property_split = True
         settings = context.scene.frost
+        layout.operator("frost.render", text="Render with Frost (F12)", icon='RENDER_STILL')
         column = layout.column(align=True)
         column.prop(settings, "samples")
         column.prop(settings, "bounces")
@@ -37,19 +38,24 @@ class RENDER_PT_frost(bpy.types.Panel):
         # by Generated coordinates, a shader that is not the Principled --
         # is baked to textures once, and the export uses those instead.
         box = layout.box()
-        pending = bake.objects_needing_bake(context.scene)
+        pending, world = bake.pending(context.scene)
         baked = [o for o in context.scene.objects if o.type == 'MESH' and o.get(bake.BAKE_KEY) is not None]
         if pending:
-            box.label(text="%d object%s use materials Frost cannot read." % (len(pending), "" if len(pending) == 1 else "s"),
+            box.label(text="%d object%s to bake for Frost." % (len(pending), "" if len(pending) == 1 else "s"),
                       icon='INFO')
         elif baked:
             box.label(text="Every material is readable; %d baked." % len(baked), icon='CHECKMARK')
         else:
             box.label(text="Every material here is one Frost reads.", icon='CHECKMARK')
+        if world:
+            box.label(text="The world is baked before rendering.", icon='INFO')
+        elif context.scene.get(bake.WORLD_KEY) is not None:
+            box.label(text="The world is baked.", icon='CHECKMARK')
+        box.prop(settings, "auto_bake")
         row = box.row(align=True)
-        row.operator("frost.bake", text="Bake Materials for Frost", icon='RENDER_STILL')
+        row.operator("frost.bake", text="Bake Now", icon='RENDER_STILL')
         row.prop(settings, "bake_size", text="")
-        if baked:
+        if baked or context.scene.get(bake.WORLD_KEY) is not None:
             box.operator("frost.clear_bake", text="Forget the Bakes", icon='X')
 
         frost = properties.find_frost(properties.preferences(context))

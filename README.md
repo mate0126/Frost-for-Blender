@@ -43,13 +43,17 @@ own the first time it renders).
   exactly, factors and packed maps included.
 - Lights: one sun, point lights, spot lights, and area lights (rendered as
   the emissive surfaces they are, at the power you set).
-- The world, in its three forms: a colour at a strength; an **HDRI** (an
-  Environment Texture, turned by a Mapping node's Z rotation), which lights
-  the scene and stands behind it, with the sun in the picture found by
-  Frost's light sampling so it casts real shadows; and the **Sky Texture**
-  (Nishita), which becomes Frost's own physical atmosphere with the sun
-  where the node puts it, the air by the node's aerosol, the ground's
-  altitude, and the strengths calibrated against Cycles on the same scene.
+- **The world, whatever it is made of.** A colour at a strength and an
+  **HDRI** (an Environment Texture, turned by a Mapping node's Z rotation)
+  go over as they are, lighting the scene and standing behind it, with the
+  sun in the picture found by Frost's light sampling so it casts real
+  shadows. Anything else -- a **Sky Texture**, a graph of ramps and
+  blackbodies, a world nobody could describe in a sentence -- is rendered
+  once by Cycles into an equirectangular picture of that very sky, sun
+  included, and Frost lights the scene with it and shows it behind. The
+  sky you see is the sky Cycles draws. Without a bake, a Sky Texture falls
+  back to Frost's own physical atmosphere, set from the node's air,
+  aerosol and ozone.
 - **Boxes of fog**: a mesh whose material is a Principled Volume (or a
   Volume Scatter) and no surface becomes a volume in Frost -- an even fog in
   the box at the node's density, colour and anisotropy -- rather than a wall.
@@ -98,11 +102,9 @@ the render window as it goes.
   (the traced view fills the region).
 - Animation and motion blur through the add-on. Frost itself does both;
   the add-on renders the current frame.
-- Smoke and fire simulations, hair, and shader node trees beyond the
-  Principled BSDF and image textures: a procedural material (noise, ramps,
-  mixes) renders with the values on its Principled sockets, and a world
-  built from nodes other than a colour, an Environment Texture or a Sky
-  Texture renders under a plain grey and says so in the log.
+- Smoke and fire simulations, and hair. A procedural material renders
+  with the values on its Principled sockets until it is baked, which F12
+  does for you.
 - Passes other than Combined.
 
 ## The view transform

@@ -462,16 +462,166 @@ def needs_bake(material):
     return not all(readable(surface[key]) for key in ("base", "roughness", "metallic", "normal", "emission"))
 
 
+def bake_folder():
+    base = os.path.join(os.path.expanduser("~"), "Library", "Caches", "Frost for Blender", "bakes")
+    stem = bpy.path.clean_name(os.path.splitext(os.path.basename(bpy.data.filepath))[0]) or "untitled"
+    folder = os.path.join(base, stem)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def world_folder():
+    folder = os.path.join(os.path.expanduser("~"), "Library", "Caches", "Frost for Blender", "worlds")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def manifest_read(folder):
+    """What has been baked into this folder before, by name or stamp. A
+    bake lives on the object as a custom property, which is in the .blend
+    only once it is saved; the manifest is so that opening a file that was
+    never saved -- or saved before the bake -- does not bake it all again."""
+    try:
+        with open(os.path.join(folder, "baked.json")) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def manifest_write(folder, key, record):
+    data = manifest_read(folder)
+    data[key] = record
+    try:
+        with open(os.path.join(folder, "baked.json"), "w") as f:
+            json.dump(data, f, indent=1)
+    except Exception:
+        pass
+
+
+def record_files_exist(record):
+    """Every picture a bake names is still in the cache."""
+    for entry in record.get("materials", {}).values():
+        for key in ("color", "roughness", "normal", "emit"):
+            path = entry.get(key)
+            if path and not os.path.isfile(path):
+                return False
+    return True
+
+
 def bake_record(obj):
-    """The object's bake, as a plain dict, or None."""
+    """The object's bake, as a plain dict, or None: from the object, or
+    from the cache's manifest when this session has not baked it."""
     original = getattr(obj, "original", obj)
     record = original.get(BAKE_KEY)
+    if record is not None:
+        try:
+            record = record.to_dict()
+        except AttributeError:
+            record = dict(record)
+        return record if record_files_exist(record) else None
+    record = manifest_read(bake_folder()).get(original.name)
+    if record is None or not record_files_exist(record):
+        return None
+    return record
+
+
+def graph_stamp(tree, extra=""):
+    """A fingerprint of a node tree -- the nodes, what is typed into them,
+    the pictures behind them, the wires -- so a bake knows the graph it was
+    made from and a changed one is baked again."""
+    parts = [extra]
+    if tree is not None:
+        for node in tree.nodes:
+            parts.append(node.type + "|" + node.name)
+            for sock in node.inputs:
+                if sock.is_linked:
+                    continue
+                value = getattr(sock, "default_value", None)
+                if value is None:
+                    continue
+                try:
+                    parts.append(",".join("%.5g" % float(x) for x in value))
+                except TypeError:
+                    try:
+                        parts.append("%.5g" % float(value))
+                    except (TypeError, ValueError):
+                        parts.append(str(value))
+            image = getattr(node, "image", None)
+            if image is not None:
+                parts.append("%s %s %s" % (image.name, tuple(image.size),
+                                           image.packed_file.size if image.packed_file else image.filepath))
+            for attr in ("sky_type", "sun_elevation", "sun_rotation", "sun_intensity", "sun_size", "sun_disc",
+                         "altitude", "air_density", "aerosol_density", "dust_density", "ozone_density", "operation",
+                         "blend_type", "data_type", "noise_dimensions", "feature", "distance", "interpolation",
+                         "uv_map", "attribute_name", "projection", "extension", "invert", "use_clamp",
+                         "noise_type", "normalize", "wave_type", "bands_direction", "wave_profile", "gradient_type",
+                         "coloring", "musgrave_type"):
+                if hasattr(node, attr):
+                    parts.append("%s=%s" % (attr, getattr(node, attr)))
+            ramp = getattr(node, "color_ramp", None)
+            if ramp is not None:
+                parts.append(";".join("%.4f:%s" % (e.position, ",".join("%.4f" % c for c in e.color))
+                                      for e in ramp.elements))
+        for link in tree.links:
+            parts.append("%s.%s>%s.%s" % (link.from_node.name, link.from_socket.identifier,
+                                          link.to_node.name, link.to_socket.identifier))
+    return hashlib.sha1("\n".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def world_source(world):
+    """The world's Background node and the node feeding its Color, either
+    None when there is no such thing."""
+    if world is None or not getattr(world, "use_nodes", True) or world.node_tree is None:
+        return None, None
+    background = None
+    for node in world.node_tree.nodes:
+        if node.type == 'BACKGROUND':
+            background = node
+            break
+    if background is None:
+        return None, None
+    colour_socket = socket(background, "Color")
+    source = colour_socket.links[0].from_node if colour_socket is not None and colour_socket.is_linked else None
+    return background, source
+
+
+# Bumped when the world baker itself changes, so a picture baked by an
+# older one is made again rather than trusted.
+WORLD_BAKE_VERSION = "3"
+
+
+def world_stamp(scene):
+    world = scene.world
+    return graph_stamp(world.node_tree if world is not None else None,
+                       (world.name if world is not None else "") + "|v" + WORLD_BAKE_VERSION)
+
+
+def world_record(scene):
+    """The scene's world bake, as a plain dict, when it is of the world as
+    it stands and its picture is still there; else None."""
+    original = getattr(scene, "original", scene)
+    record = original.get(WORLD_KEY)
     if record is None:
         return None
     try:
-        return record.to_dict()
+        record = record.to_dict()
     except AttributeError:
-        return dict(record)
+        record = dict(record)
+    if record.get("stamp") != world_stamp(scene) or not os.path.isfile(record.get("image", "")):
+        return None
+    return record
+
+
+def world_record_cached(scene):
+    """The world's bake from the scene, or from the cache's manifest when
+    this session has not baked it."""
+    record = world_record(scene)
+    if record is not None:
+        return record
+    record = manifest_read(world_folder()).get(world_stamp(scene))
+    if record is None or not os.path.isfile(record.get("image", "")):
+        return None
+    return record
 
 
 def material_json(writer, material, overrides):
@@ -869,8 +1019,14 @@ def camera_json(depsgraph, scene, width, height, warnings):
 # mapped over, the plane's brightness with and without the sun disc, and
 # these are the ratios (tools/bench/nishita_calibrate.py): Cycles' plane
 # 6.25 with the sun and 1.76 without against Frost's 0.296 and 0.071.
-SUN_FROM_NISHITA = 19.9
-SKY_FROM_NISHITA = 24.9
+# Against the tables Frost makes for the node's own air (tools/bench/
+# nishita_calibrate.py): the fallback when the world has not been baked.
+SUN_FROM_NISHITA = 10.0
+SKY_FROM_NISHITA = 8.47
+# The world's bake, recorded on the scene: an equirectangular picture of
+# the sky Cycles rendered from the world's own nodes, and a Sky Texture's
+# sun measured off its disc.
+WORLD_KEY = "frost_world_bake"
 
 
 def mapping_turn(node):
@@ -895,23 +1051,42 @@ def atmosphere_json(node, strength):
     direction is geographical_to_direction(elevation, rotation + pi/2)."""
     if hasattr(node, "sun_elevation"):
         elevation, rotation = float(node.sun_elevation), float(node.sun_rotation)
-        to_sun = Vector((math.cos(elevation) * math.cos(rotation + math.pi / 2.0),
-                         math.cos(elevation) * math.sin(rotation + math.pi / 2.0),
+        # The Sky Texture's rotation is measured the other way round from a
+        # bearing: the sun's azimuth is pi/2 - rotation. Sent as
+        # rotation + pi/2 it came out 83 degrees off on Blender's own sky
+        # demo, which is why Frost drew that scene with the glow in the
+        # wrong half of the sky and the shadows pointing the wrong way.
+        # Found by sweeping a narrow Cycles view round the horizon and
+        # asking which way was bright.
+        azimuth = math.pi / 2.0 - rotation
+        to_sun = Vector((math.cos(elevation) * math.cos(azimuth),
+                         math.cos(elevation) * math.sin(azimuth),
                          math.sin(elevation)))
         sun_strength = float(node.sun_intensity) if getattr(node, "sun_disc", True) else 0.0
         angle = float(getattr(node, "sun_size", 0.0095))
         altitude = float(getattr(node, "altitude", 0.0))
+        air = float(getattr(node, "air_density", 1.0))
         aerosol = float(getattr(node, "aerosol_density", getattr(node, "dust_density", 1.0)))
+        ozone = float(getattr(node, "ozone_density", 1.0))
     else:
         # The older models: a direction and a turbidity.
         to_sun = Vector(node.sun_direction).normalized()
         sun_strength = 1.0
         angle = 0.0095
         altitude = 0.0
+        air = 1.0
         aerosol = float(getattr(node, "turbidity", 2.2)) / 2.2
+        ozone = 1.0
     preset = "dusty" if aerosol >= 5.0 else ("hazy" if aerosol >= 2.0 else "clear")
+    # The node's own three numbers -- the air, the aerosol and the ozone as
+    # multiples of a clear day's -- go over as they are: Frost makes the
+    # tables for exactly that air. The preset is the fallback for a Frost
+    # from before it read them.
     return {
         "preset": preset,
+        "air": air,
+        "aerosol": aerosol,
+        "ozone": ozone,
         "altitude": altitude,
         "strength": strength * SKY_FROM_NISHITA,
         "sun": {"direction": to_frost(-to_sun), "strength": strength * sun_strength * SUN_FROM_NISHITA,
@@ -920,26 +1095,38 @@ def atmosphere_json(node, strength):
 
 
 def world_json(scene, warnings):
-    """The world as (world, atmosphere): a colour at a strength or a picture
-    of the sky (Environment Texture) in the world block, and Blender's Sky
-    Texture as an atmosphere block beside it."""
+    """The world as (world, atmosphere, sun): a colour at a strength or a
+    picture of the sky in the world block -- an Environment Texture as it
+    is, or any other world as the picture Cycles baked of it, a Sky Texture
+    included, with the Sky Texture's sun measured off its disc as a sun
+    light; and, when a Sky Texture has not been baked, Blender's sky as an
+    atmosphere block near it."""
     world = scene.world
     colour, strength = (0.05, 0.05, 0.05), 1.0
     result = None
     atmosphere = None
+    sun = None
     if world is not None:
-        background = None
-        if getattr(world, "use_nodes", True) and world.node_tree is not None:
-            for node in world.node_tree.nodes:
-                if node.type == 'BACKGROUND':
-                    background = node
-                    break
+        background, source = world_source(world)
         if background is not None:
             strength = float(value_of(socket(background, "Strength"), 1.0))
             colour_socket = socket(background, "Color")
-            source = colour_socket.links[0].from_node if colour_socket is not None and colour_socket.is_linked else None
-            if source is not None and source.type == 'TEX_SKY':
+            record = world_record_cached(scene) if source is not None and source.type != 'TEX_ENVIRONMENT' else None
+            if record is not None:
+                # The world as Cycles drew it: the same sky, exactly, and
+                # the same light off it. The bake includes the Background's
+                # strength.
+                result = {"image": record["image"], "strength": 1.0, "rotation": 0.0}
+                if any(node.type == 'LIGHT_PATH' for node in world.node_tree.nodes):
+                    warnings.append("This world shows one thing to the camera and another to everything else "
+                                    "(a Light Path node). Frost has one sky: it is the one the world lights "
+                                    "with, so the backdrop may differ from Cycles.")
+                if record.get("sun"):
+                    sun = record["sun"]
+            elif source is not None and source.type == 'TEX_SKY':
                 atmosphere = atmosphere_json(source, strength)
+                warnings.append("The Sky Texture is rendered as an atmosphere near it; press F12 with Frost, or "
+                                "Bake for Frost, to render the very same sky.")
             elif source is not None and source.type == 'TEX_ENVIRONMENT' and source.image is not None:
                 path = cached_image(source.image, hdr=True)
                 if path:
@@ -948,7 +1135,8 @@ def world_json(scene, warnings):
                     warnings.append("The world's picture could not be written out (%s); a plain grey stands in."
                                     % (last_image_error or "no reason given"))
             elif source is not None:
-                warnings.append("The world's colour comes from a %s node Frost does not read; a plain grey stands in."
+                warnings.append("The world's colour comes from a %s node Frost does not read, and it has not been "
+                                "baked; a plain grey stands in. Press F12 with Frost, or Bake for Frost."
                                 % source.type.replace('_', ' ').lower())
             else:
                 colour = tuple(value_of(colour_socket, (0.05, 0.05, 0.05, 1.0))[:3])
@@ -956,7 +1144,7 @@ def world_json(scene, warnings):
             colour = tuple(world.color)
     if result is None:
         result = {"color": [float(c) for c in colour], "strength": strength}
-    return result, atmosphere
+    return result, atmosphere, sun
 
 
 # ---- volumes ---------------------------------------------------------------
@@ -1071,7 +1259,9 @@ def export_scene(depsgraph, scene, out_dir, width, height, settings):
     gltf = writer.write("scene")
     warnings.extend(writer.warnings)
 
-    world, atmosphere = world_json(scene, warnings)
+    world, atmosphere, world_sun = world_json(scene, warnings)
+    if sun is None and world_sun is not None:
+        sun = world_sun
     setup = {
         "camera": camera_json(depsgraph, scene, width, height, warnings),
         "world": world,

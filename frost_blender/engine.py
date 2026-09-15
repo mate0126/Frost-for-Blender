@@ -185,6 +185,19 @@ class FrostRenderEngine(bpy.types.RenderEngine):
 
         work = tempfile.mkdtemp(prefix="frost-")
         try:
+            # A render started past the operator that bakes first -- from a
+            # script, or with the bake switched off -- says what it is
+            # missing rather than silently rendering it plain.
+            try:
+                from . import bake
+                original = getattr(scene, "original", scene)
+                objects, world = bake.pending(original)
+                if objects or world:
+                    log("not baked: %d objects%s" % (len(objects), " and the world" if world else ""))
+                    self.report({'WARNING'}, "%d object%s%s not baked for Frost; press F12 with Frost, or Bake Now"
+                                % (len(objects), "" if len(objects) == 1 else "s", " and the world" if world else ""))
+            except Exception as error:
+                log("bake check failed: %s" % error)
             self.update_stats("Frost", "Writing the scene")
             gltf, setup, warnings = export.export_scene(depsgraph, scene, work, width, height, scene.frost)
             for warning in warnings:
@@ -192,6 +205,35 @@ class FrostRenderEngine(bpy.types.RenderEngine):
                 log("warning: " + warning)
             if self.test_break():
                 return
+
+            # What actually went over, in the log: the tell for "the sky is
+            # wrong" or "the fog is missing" is whether the block is there
+            # at all, and a render's own temporary folder is gone by the
+            # time anybody looks.
+            try:
+                import json as _json
+                with open(setup) as _f:
+                    _setup = _json.load(_f)
+                _world = _setup.get("world", {})
+                log("setup: world %s, atmosphere %s, sun %s, %d lights, %d volumes, %d material overrides"
+                    % ("a picture" if "image" in _world else "a colour",
+                       "yes" if _setup.get("atmosphere") else "no",
+                       "yes" if _setup.get("sun") else "no",
+                       len(_setup.get("lights") or []), len(_setup.get("volumes") or []),
+                       len(_setup.get("materials") or {})))
+            except Exception as _error:
+                log("setup: could not be summarised (%s)" % _error)
+
+            # FROST_KEEP_SETUP=1 keeps the scene file and the setup beside
+            # the log: what went over, exactly, after the render's own
+            # temporary folder is gone.
+            if os.environ.get("FROST_KEEP_SETUP"):
+                try:
+                    kept = os.path.dirname(log_path())
+                    shutil.copy(setup, os.path.join(kept, "last-setup.json"))
+                    log("setup kept at " + os.path.join(kept, "last-setup.json"))
+                except Exception as _error:
+                    log("setup could not be kept (%s)" % _error)
 
             out = os.path.join(work, "frame.png")
             snapshot_path = os.path.join(work, "progress.bgra")
