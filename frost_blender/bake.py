@@ -129,6 +129,39 @@ def save_linear_exr(pixels, width, height, path):
         bpy.data.images.remove(fresh)
 
 
+def world_panorama(temp, width, height, path):
+    """One equirectangular render of the temporary world scene, as linear
+    floats. Both branches of a world go through this, so the two are shot
+    through the very same lens and land on the same texels."""
+    raw = path + ".raw.exr"
+    temp.render.resolution_x, temp.render.resolution_y = width, height
+    temp.render.filepath = raw
+    bpy.ops.render.render(write_still=True, scene=temp.name)
+    image = bpy.data.images.load(raw)
+    try:
+        pixels = np.empty(width * height * 4, dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+    finally:
+        bpy.data.images.remove(image)
+    try:
+        os.remove(raw)
+    except OSError:
+        pass
+    return pixels.reshape(height, width, 4)
+
+
+def flat_colour(pixels):
+    """The one colour a picture is, when it is one colour and nothing else;
+    otherwise None. A studio's backdrop is usually a flat grey or a black,
+    and the colour itself is exact where a two-megapixel picture of it is a
+    file to carry around and read back."""
+    rgb = pixels[:, :, :3].reshape(-1, 3)
+    low, high = rgb.min(axis=0), rgb.max(axis=0)
+    if float(np.max(high - low)) > 1e-4:
+        return None
+    return [float(c) for c in (low + high) * 0.5]
+
+
 def bake_world(scene, folder):
     """The world alone, rendered by Cycles as an equirectangular picture of
     the sky and recorded on the scene, so Frost lights the scene with the
@@ -147,28 +180,30 @@ def bake_world(scene, folder):
     A world that shows one thing to the camera and another to everything
     else -- a Light Path node into a Mix, which is how a studio backdrop is
     made black behind the product while the softboxes still light it -- is
-    baked with those nodes muted, so what is captured is what lights the
-    scene rather than the black the camera sees. On the user's own product
-    scene that is forty-eight times as much light, and the difference
-    between a rendered frame and a black one.
+    baked twice. Once with those nodes muted, which is what lights the
+    scene and becomes the sky; and once as the world stands, which is what
+    the camera sees and becomes the backdrop: a colour when it is one
+    colour, a picture when it is not. Baking the lighting branch alone hung
+    the softbox rig itself behind the product -- "it just puts in skies that
+    were not a part of the project" -- and baking the camera's branch alone
+    is the black frame this started as.
 
     Returns the record, or raises."""
     world = scene.world
     background, source = export.world_source(world)
     if background is None:
         return None
-    muted = []
     stem = bpy.path.clean_name(os.path.splitext(os.path.basename(bpy.data.filepath))[0]) or "untitled"
     stamp = export.world_stamp(scene)
     path = os.path.join(folder, "%s-%s-%s.exr" % (stem, bpy.path.clean_name(world.name), stamp))
+    width, height = 2048, 1024
+    tree = world.node_tree
+    light_paths = [node for node in tree.nodes if node.type == 'LIGHT_PATH'] if tree is not None else []
+    muted = []
     temp = bpy.data.scenes.new("Frost World Bake")
     camera_data = bpy.data.cameras.new("Frost World Camera")
     camera = bpy.data.objects.new("Frost World Camera", camera_data)
     try:
-        for node in world.node_tree.nodes:
-            if node.type == 'LIGHT_PATH' and not node.mute:
-                node.mute = True
-                muted.append(node)
         temp.world = world
         temp.collection.objects.link(camera)
         temp.camera = camera
@@ -196,23 +231,33 @@ def bake_world(scene, folder):
         # each quarter turn, and the one whose brightest texel lands where
         # the Environment Texture's own mapping says it should.
         camera.rotation_euler = (math.pi / 2.0, 0.0, -math.pi / 2.0)
-        width, height = 2048, 1024
-        raw = path + ".raw.exr"
-        temp.render.resolution_x, temp.render.resolution_y = width, height
-        temp.render.filepath = raw
-        bpy.ops.render.render(write_still=True, scene=temp.name)
-        image = bpy.data.images.load(raw)
-        try:
-            pixels = np.empty(width * height * 4, dtype=np.float32)
-            image.pixels.foreach_get(pixels)
-        finally:
-            bpy.data.images.remove(image)
-        try:
-            os.remove(raw)
-        except OSError:
-            pass
-        save_linear_exr(pixels.reshape(height, width, 4), width, height, path)
         record = {"stamp": stamp, "image": path, "when": time.strftime("%Y-%m-%d %H:%M")}
+
+        # What lights the scene.
+        for node in light_paths:
+            if not node.mute:
+                node.mute = True
+                muted.append(node)
+        save_linear_exr(world_panorama(temp, width, height, path), width, height, path)
+
+        # And what the camera sees, when the project says that is something
+        # else. A transparent film says it too: Frost has no alpha channel,
+        # and black is what a transparent film is composited over.
+        if scene.render.film_transparent:
+            record["backdrop_color"] = [0.0, 0.0, 0.0]
+        elif muted:
+            for node in muted:
+                node.mute = False
+            del muted[:]
+            seen = world_panorama(temp, width, height, path + ".backdrop")
+            colour = flat_colour(seen)
+            if colour is not None:
+                record["backdrop_color"] = colour
+            else:
+                backdrop = path[:-4] + "-backdrop.exr"
+                save_linear_exr(seen, width, height, backdrop)
+                record["backdrop"] = backdrop
+
         original = getattr(scene, "original", scene)
         original[WORLD_KEY] = record
         export.manifest_write(folder, stamp, record)
@@ -220,9 +265,12 @@ def bake_world(scene, folder):
     finally:
         for node in muted:
             node.mute = False
-        bpy.data.objects.remove(camera)
-        bpy.data.cameras.remove(camera_data)
-        bpy.data.scenes.remove(temp)
+        try:
+            bpy.data.scenes.remove(temp)
+            bpy.data.objects.remove(camera)
+            bpy.data.cameras.remove(camera_data)
+        except (ReferenceError, RuntimeError, TypeError):
+            pass
 
 
 def pending(scene):

@@ -314,6 +314,22 @@ def uv_mapped(node):
         if source.type == 'TEX_COORD':
             return link.from_socket.name == 'UV'
         if source.type == 'MAPPING':
+            # A Mapping that moves, turns or repeats the picture is not
+            # something Frost can follow: it reads the mesh's UVs as they
+            # are, so the picture came out at the wrong scale. Baked, it is
+            # right. An identity Mapping changes nothing and is followed.
+            for name, neutral in (("Location", 0.0), ("Rotation", 0.0), ("Scale", 1.0)):
+                sock = socket(source, name)
+                if sock is None:
+                    continue
+                if sock.is_linked:
+                    return False
+                try:
+                    if any(abs(float(v) - neutral) > 1e-6 for v in sock.default_value):
+                        return False
+                except TypeError:
+                    if abs(float(sock.default_value) - neutral) > 1e-6:
+                        return False
             vector = socket(source, "Vector")
             continue
         return False
@@ -391,6 +407,10 @@ def shader_surface(node, depth=0):
     elif kind in ('BSDF_GLOSSY', 'BSDF_METALLIC'):
         surface.update({"base": socket(node, "Color", "Base Color"), "metallic": 1.0,
                         "roughness": socket(node, "Roughness"), "normal": socket(node, "Normal")})
+        # A Glossy on its own is a mirror; mixed over something else it is
+        # the coat on it, which is a different surface entirely.
+        if kind == 'BSDF_GLOSSY':
+            surface["coat"] = True
     elif kind == 'EMISSION':
         surface.update({"base": (0.0, 0.0, 0.0), "emission": socket(node, "Color"),
                         "strength": socket(node, "Strength")})
@@ -430,6 +450,19 @@ def blend_surfaces(a, b, fac):
     out = dict(heavy)
     for key, fallback in (("roughness", 0.5), ("metallic", 0.0), ("transmission", 0.0), ("ior", 1.45)):
         out[key] = number_of(a[key], fallback) * (1.0 - fac) + number_of(b[key], fallback) * fac
+    # A Glossy mixed over something that is not metal is the shine on it,
+    # not a part-metal: blended as metal the highlight takes the surface's
+    # own colour and goes dull, and a glossy-over-diffuse -- the commonest
+    # material in any file without a Principled -- rendered flat matte.
+    # Kept as a dielectric at the coat's own roughness, the highlight is
+    # white and sharp, which is what Cycles draws.
+    coats = [s for s in (a, b) if s.get("coat")]
+    plains = [s for s in (a, b) if not s.get("coat")]
+    if len(coats) == 1 and len(plains) == 1 and number_of(plains[0]["metallic"], 0.0) < 0.5:
+        out["base"] = plains[0]["base"]
+        out["metallic"] = 0.0
+        out["roughness"] = number_of(coats[0]["roughness"], 0.1)
+        out["coat"] = False
     if not is_socket(a["base"]) and not is_socket(b["base"]):
         ca, cb = colour_of(a["base"], (0.8, 0.8, 0.8)), colour_of(b["base"], (0.8, 0.8, 0.8))
         out["base"] = tuple(ca[i] * (1.0 - fac) + cb[i] * fac for i in range(3))
@@ -508,6 +541,22 @@ def record_files_exist(record):
     return True
 
 
+def record_fits(obj, record):
+    """Whether this object can actually read that bake: the pictures are in
+    the cache and the mesh carries the UV map they were baked on. The
+    manifest remembers a bake by the object's name, and a name is not an
+    object: a sphere called "procedural" in one file was handed the bake of
+    another file's sphere of the same name, sampled it through its own
+    lat-long unwrap, and came out in black patches."""
+    if not record_files_exist(record):
+        return False
+    mesh = getattr(obj, "data", None)
+    layers = getattr(mesh, "uv_layers", None)
+    if layers is None:
+        return False
+    return layers.get(record.get("uv", BAKE_UV)) is not None
+
+
 def bake_record(obj):
     """The object's bake, as a plain dict, or None: from the object, or
     from the cache's manifest when this session has not baked it."""
@@ -518,9 +567,9 @@ def bake_record(obj):
             record = record.to_dict()
         except AttributeError:
             record = dict(record)
-        return record if record_files_exist(record) else None
+        return record if record_fits(original, record) else None
     record = manifest_read(bake_folder()).get(original.name)
-    if record is None or not record_files_exist(record):
+    if record is None or not record_fits(original, record):
         return None
     return record
 
@@ -587,7 +636,7 @@ def world_source(world):
 
 # Bumped when the world baker itself changes, so a picture baked by an
 # older one is made again rather than trusted.
-WORLD_BAKE_VERSION = "3"
+WORLD_BAKE_VERSION = "4"
 
 
 def world_stamp(scene):
@@ -609,6 +658,9 @@ def world_record(scene):
         record = dict(record)
     if record.get("stamp") != world_stamp(scene) or not os.path.isfile(record.get("image", "")):
         return None
+    backdrop = record.get("backdrop")
+    if backdrop and not os.path.isfile(backdrop):
+        return None
     return record
 
 
@@ -620,6 +672,9 @@ def world_record_cached(scene):
         return record
     record = manifest_read(world_folder()).get(world_stamp(scene))
     if record is None or not os.path.isfile(record.get("image", "")):
+        return None
+    backdrop = record.get("backdrop")
+    if backdrop and not os.path.isfile(backdrop):
         return None
     return record
 
@@ -1117,10 +1172,16 @@ def world_json(scene, warnings):
                 # the same light off it. The bake includes the Background's
                 # strength.
                 result = {"image": record["image"], "strength": 1.0, "rotation": 0.0}
-                if any(node.type == 'LIGHT_PATH' for node in world.node_tree.nodes):
-                    warnings.append("This world shows one thing to the camera and another to everything else "
-                                    "(a Light Path node). Frost has one sky: it is the one the world lights "
-                                    "with, so the backdrop may differ from Cycles.")
+                # A world with two answers in it -- the rig that lights the
+                # product, and the colour or picture behind it -- was baked
+                # twice, and the camera's own answer is the backdrop. Frost
+                # shows it to a camera ray and nothing else, so a reflection
+                # still finds the rig that is really there.
+                if record.get("backdrop"):
+                    result["backdrop"] = {"image": record["backdrop"], "strength": 1.0}
+                elif record.get("backdrop_color") is not None:
+                    result["backdrop"] = {"color": [float(c) for c in record["backdrop_color"]],
+                                          "strength": 1.0}
                 if record.get("sun"):
                     sun = record["sun"]
             elif source is not None and source.type == 'TEX_SKY':
@@ -1144,6 +1205,14 @@ def world_json(scene, warnings):
             colour = tuple(world.color)
     if result is None:
         result = {"color": [float(c) for c in colour], "strength": strength}
+    # A transparent film says the shot has nothing behind it at all. Frost
+    # has no alpha channel, so black is what it renders there -- which is
+    # what a transparent film is composited over in any case, and not the
+    # sky that happens to be lighting the shot.
+    if scene.render.film_transparent and "backdrop" not in result:
+        result["backdrop"] = {"color": [0.0, 0.0, 0.0], "strength": 1.0}
+        warnings.append("The film is transparent, so the shot has nothing behind it. Frost has no alpha "
+                        "channel and renders the background black.")
     return result, atmosphere, sun
 
 

@@ -54,6 +54,14 @@ own the first time it renders).
   sky you see is the sky Cycles draws. Without a bake, a Sky Texture falls
   back to Frost's own physical atmosphere, set from the node's air,
   aerosol and ozone.
+- **The backdrop, apart from the sky that lights the shot.** A world that
+  shows one thing to the camera and another to everything else -- a Light
+  Path node into a Mix, which is how a studio backdrop is made black
+  behind the product while the softboxes still light it -- is baked twice:
+  the branch that lights becomes Frost's sky, and the branch the camera
+  sees becomes what stands behind the shot. A reflection in the product
+  still finds the softboxes, because that is what is really around it. A
+  transparent film is sent black, since Frost has no alpha channel.
 - **Boxes of fog**: a mesh whose material is a Principled Volume (or a
   Volume Scatter) and no surface becomes a volume in Frost -- an even fog in
   the box at the node's density, colour and anisotropy -- rather than a wall.
@@ -72,7 +80,9 @@ Add of those, so a material without a Principled still comes through with
 its colour, its shine and its glow. What no exporter can hand over as it
 is: a procedural graph (noise, ramps, mixes by pointiness or vertex
 colour) and a picture mapped by Generated or Object coordinates rather
-than UVs. The Frost panel counts the objects whose materials are like
+than UVs -- and a picture behind a Mapping node that moves, turns or
+repeats it, which is not the mesh's own unwrap however much it looks like
+one. The Frost panel counts the objects whose materials are like
 that, and **Bake Materials for Frost** bakes them the way every pipeline
 that hands a Blender scene to another renderer does: Cycles bakes each
 such material's colour, roughness, normal and emission into pictures at
@@ -84,7 +94,9 @@ renders with the pictures in the material's place. The pictures live in
 them in a custom property, and **Forget the Bakes** takes that off. Bake
 again after changing a baked material; the count in the panel says when
 nothing needs it. Metallic is taken as the material's value, since Cycles
-has no bake for it.
+has no bake for it. A bake is used only on a mesh that carries the
+UV map it was baked on, so a bake made for one object is never worn by
+another of the same name.
 
 ## The traced viewport
 
