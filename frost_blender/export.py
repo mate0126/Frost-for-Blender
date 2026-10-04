@@ -339,7 +339,18 @@ def uv_mapped(node):
 # ---- the surface, whatever shader makes it ----------------------------------
 
 PLAIN_SURFACE = {"base": (0.8, 0.8, 0.8), "roughness": 0.5, "metallic": 0.0, "normal": None,
-                 "emission": (0.0, 0.0, 0.0), "strength": 0.0, "transmission": 0.0, "ior": 1.45}
+                 "emission": (0.0, 0.0, 0.0), "strength": 0.0, "transmission": 0.0, "ior": 1.45,
+                 "alpha": 1.0,
+                 # The layers. A product material is not a base colour and a
+                 # roughness: it is a varnish over a substrate, a fibre lobe,
+                 # a metal's measured index, a medium with a depth. All of it
+                 # sits on the Principled and on the Metallic BSDF, and none
+                 # of it was being read.
+                 "coat": 0.0, "coat_roughness": 0.03, "coat_ior": 1.5, "coat_tint": (1.0, 1.0, 1.0),
+                 "sheen": 0.0, "sheen_roughness": 0.3, "sheen_tint": (1.0, 1.0, 1.0),
+                 "anisotropy": 0.0, "aniso_rotation": 0.0, "aniso_mode": 0,
+                 "conductor_n": None, "conductor_k": None,
+                 "absorption": None, "absorption_depth": 0.0, "thin_walled": False}
 
 
 def is_socket(value):
@@ -380,6 +391,24 @@ def output_shader(material):
     return surface.links[0].from_node
 
 
+def tangent_mode(node):
+    """Which way the brushing runs, from the Tangent node wired into a BSDF.
+
+    A lathed or spun part is brushed in circles about its own axis -- a turned
+    knob, a brushed dial -- and the mesh's own tangent says nothing about that,
+    so a radial tangent streaked the wrong way round. 0 is the mesh's tangent,
+    1/2/3 radial about the object's X, Y or Z."""
+    sock = socket(node, "Tangent")
+    if sock is None or not sock.is_linked:
+        return 0
+    src = sock.links[0].from_node
+    if src.type != 'TANGENT' or getattr(src, "direction_type", "") != 'RADIAL':
+        return 0
+    # Blender's axes are Z up; Frost's are Y up, and the turn is the one every
+    # other direction in this exporter takes.
+    return {"X": 1, "Y": 3, "Z": 2}.get(getattr(src, "axis", "Z"), 2)
+
+
 def shader_surface(node, depth=0):
     """A shader node as what Frost's material is: sockets to follow (a
     picture may be behind them) or plain values. The Principled BSDF as it
@@ -401,12 +430,35 @@ def shader_surface(node, depth=0):
                         "emission": socket(node, "Emission Color", "Emission"),
                         "strength": socket(node, "Emission Strength"),
                         "transmission": socket(node, "Transmission Weight", "Transmission"),
-                        "ior": socket(node, "IOR")})
+                        "ior": socket(node, "IOR"), "alpha": socket(node, "Alpha"),
+                        "coat": socket(node, "Coat Weight", "Clearcoat"),
+                        "coat_roughness": socket(node, "Coat Roughness", "Clearcoat Roughness"),
+                        "coat_ior": socket(node, "Coat IOR"),
+                        "coat_tint": socket(node, "Coat Tint"),
+                        "sheen": socket(node, "Sheen Weight", "Sheen"),
+                        "sheen_roughness": socket(node, "Sheen Roughness"),
+                        "sheen_tint": socket(node, "Sheen Tint"),
+                        "anisotropy": socket(node, "Anisotropic"),
+                        "aniso_rotation": socket(node, "Anisotropic Rotation"),
+                        "aniso_mode": tangent_mode(node)})
     elif kind == 'BSDF_DIFFUSE':
         surface.update({"base": socket(node, "Color"), "roughness": 0.9, "normal": socket(node, "Normal")})
     elif kind in ('BSDF_GLOSSY', 'BSDF_METALLIC'):
         surface.update({"base": socket(node, "Color", "Base Color"), "metallic": 1.0,
-                        "roughness": socket(node, "Roughness"), "normal": socket(node, "Normal")})
+                        "roughness": socket(node, "Roughness"), "normal": socket(node, "Normal"),
+                        "anisotropy": socket(node, "Anisotropy", "Anisotropic"),
+                        "aniso_rotation": socket(node, "Rotation", "Anisotropic Rotation"),
+                        "aniso_mode": tangent_mode(node)})
+        # A conductor's colour is the Fresnel response of its complex index,
+        # which is why gold goes white at the rim instead of staying yellow.
+        # Blender states it two ways and both are worth carrying: the measured
+        # n and k, or F82's reflectance at normal incidence and at the edge.
+        if getattr(node, "fresnel_type", "") == 'PHYSICAL_CONDUCTOR':
+            n = value_of(socket(node, "IOR"), None)
+            k = value_of(socket(node, "Extinction"), None)
+            if n is not None and k is not None:
+                surface["conductor_n"] = tuple(float(c) for c in n)[:3]
+                surface["conductor_k"] = tuple(float(c) for c in k)[:3]
         # A Glossy on its own is a mirror; mixed over something else it is
         # the coat on it, which is a different surface entirely.
         if kind == 'BSDF_GLOSSY':
@@ -418,7 +470,9 @@ def shader_surface(node, depth=0):
         surface.update({"base": socket(node, "Color"), "transmission": 1.0, "ior": socket(node, "IOR"),
                         "roughness": socket(node, "Roughness"), "normal": socket(node, "Normal")})
     elif kind == 'BSDF_TRANSPARENT':
-        surface.update({"base": socket(node, "Color"), "transmission": 1.0, "ior": 1.0, "roughness": 0.0})
+        # Not glass: a Transparent BSDF passes light straight through with no
+        # bend and no Fresnel, which is alpha.
+        surface.update({"base": socket(node, "Color"), "roughness": 0.0, "alpha": 0.0})
     elif kind in ('BSDF_TRANSLUCENT', 'SUBSURFACE_SCATTERING', 'BSDF_VELVET', 'BSDF_SHEEN', 'BSDF_TOON',
                   'BSDF_HAIR', 'BSDF_HAIR_PRINCIPLED'):
         surface.update({"base": socket(node, "Color"), "roughness": 0.9, "normal": socket(node, "Normal")})
@@ -448,7 +502,11 @@ def blend_surfaces(a, b, fac):
     emission of whichever glows."""
     heavy = b if fac >= 0.5 else a
     out = dict(heavy)
-    for key, fallback in (("roughness", 0.5), ("metallic", 0.0), ("transmission", 0.0), ("ior", 1.45)):
+    # Alpha blends like the rest: a Transparent BSDF mixed over a surface is
+    # how nearly every Blender file says "partly there", and it is alpha 0 on
+    # one side of the mix.
+    for key, fallback in (("roughness", 0.5), ("metallic", 0.0), ("transmission", 0.0), ("ior", 1.45),
+                          ("alpha", 1.0)):
         out[key] = number_of(a[key], fallback) * (1.0 - fac) + number_of(b[key], fallback) * fac
     # A Glossy mixed over something that is not metal is the shine on it,
     # not a part-metal: blended as metal the highlight takes the surface's
@@ -707,6 +765,13 @@ def material_json(writer, material, overrides):
     else:
         colour = colour_of(base, (0.8, 0.8, 0.8))
         pbr["baseColorFactor"] = [colour[0], colour[1], colour[2], 1.0]
+    # Alpha: how much of the surface is there. Blender's own Alpha socket, and
+    # what a Transparent BSDF amounts to. Unsent, a cover a product is meant to
+    # be seen through rendered as an opaque slab over the whole shot.
+    alpha = max(0.0, min(1.0, number_of(surface.get("alpha", 1.0), 1.0)))
+    pbr["baseColorFactor"][3] = alpha
+    if alpha < 0.999:
+        entry["alphaMode"] = "BLEND"
     metal, rough = surface["metallic"], surface["roughness"]
     metal_image, metal_factor = trace_image(metal) if is_socket(metal) else (None, None)
     rough_image, rough_factor = trace_image(rough) if is_socket(rough) else (None, None)
@@ -753,7 +818,70 @@ def material_json(writer, material, overrides):
         entry["extensions"]["KHR_materials_ior"] = {"ior": ior}
         writer.extensions_used.update({"KHR_materials_transmission", "KHR_materials_ior"})
         overrides.setdefault(material.name, {}).update({"transmission": transmission, "ior": ior})
+
+    # The layers glTF has no vocabulary for. They ride in the setup's material
+    # overrides, which is where everything the format cannot say already goes.
+    extra = {}
+    coat = number_of(surface["coat"], 0.0)
+    if coat > 0.0:
+        extra.update({"coat": coat,
+                      "coat_roughness": number_of(surface["coat_roughness"], 0.03),
+                      "coat_ior": number_of(surface["coat_ior"], 1.5),
+                      "coat_tint": list(colour_of(surface["coat_tint"], (1.0, 1.0, 1.0)))})
+    sheen = number_of(surface["sheen"], 0.0)
+    if sheen > 0.0:
+        extra.update({"sheen": sheen,
+                      "sheen_roughness": number_of(surface["sheen_roughness"], 0.3),
+                      "sheen_tint": list(colour_of(surface["sheen_tint"], (1.0, 1.0, 1.0)))})
+    anisotropy = number_of(surface["anisotropy"], 0.0)
+    if abs(anisotropy) > 1e-4:
+        extra["anisotropy"] = abs(anisotropy)
+        rotation = number_of(surface["aniso_rotation"], 0.0)
+        if abs(rotation) > 1e-5:
+            extra["anisotropy_rotation"] = rotation
+        mode = int(surface["aniso_mode"] or 0)
+        if mode:
+            extra["anisotropy_mode"] = mode
+    if surface["conductor_n"] is not None:
+        extra["conductor_n"] = list(surface["conductor_n"])
+        extra["conductor_k"] = list(surface["conductor_k"])
+    medium = material_medium(material)
+    if medium is not None:
+        extra["absorption"], extra["absorption_depth"] = medium
+    if extra and material is not None:
+        overrides.setdefault(material.name, {}).update(extra)
     return entry
+
+
+def material_medium(material):
+    """What a ray is tinted to after a metre of this material own medium.
+
+    A Volume Absorption on the material output is how glass, a gem or a liquid
+    states its colour in Blender, and it is the difference between a green
+    bottle and a green surface. Cycles absorbs `density * (1 - colour)` per
+    metre; Frost takes the colour a ray comes out as over a stated depth, so
+    the two are one statement written the other way round."""
+    if material is None or material.node_tree is None:
+        return None
+    output = None
+    for node in material.node_tree.nodes:
+        if node.type == 'OUTPUT_MATERIAL' and node.is_active_output:
+            output = node
+            break
+    if output is None:
+        return None
+    volume = output.inputs.get("Volume")
+    if volume is None or not volume.is_linked:
+        return None
+    node = volume.links[0].from_node
+    if node.type != 'VOLUME_ABSORPTION':
+        return None            # a scattering medium is not carried yet
+    colour = colour_of(socket(node, "Color"), (1.0, 1.0, 1.0))
+    density = number_of(socket(node, "Density"), 1.0)
+    if density <= 0.0:
+        return None
+    through = tuple(math.exp(-density * max(1.0 - c, 0.0)) for c in colour)
+    return [float(c) for c in through], 1.0
 
 
 def material_slot(writer, material, overrides):
@@ -1269,7 +1397,21 @@ def volume_json(obj, matrix, node, name):
     }
 
 
-def lights_json(depsgraph, writer, overrides, warnings):
+def record_visibility(out, obj, name):
+    """Blender's Ray Visibility for the things Frost sees as geometry. A
+    product rig is softboxes a hand's breadth outside frame with Camera
+    unticked, and an area light goes over as the emissive quad it is --
+    the only shape a tracer can sample -- so without this the camera saw
+    a metre of glowing white card in the middle of the shot and the
+    product behind it. Only what differs is written; everything else is
+    in shot, as it was."""
+    camera = bool(getattr(obj, "visible_camera", True))
+    shadow = bool(getattr(obj, "visible_shadow", True))
+    if not camera or not shadow:
+        out[name] = {"camera": camera, "shadow": shadow}
+
+
+def lights_json(depsgraph, writer, overrides, warnings, visibility):
     sun = None
     lights = []
     for instance in depsgraph.object_instances:
@@ -1298,6 +1440,7 @@ def lights_json(depsgraph, writer, overrides, warnings):
             lights.append(entry)
         elif light.type == 'AREA':
             add_area_light(writer, light, matrix, overrides, obj.name)
+            record_visibility(visibility, obj, obj.name)
     return sun, lights
 
 
@@ -1309,6 +1452,7 @@ def export_scene(depsgraph, scene, out_dir, width, height, settings):
     overrides = {}
     warnings = []
     volumes = []
+    visibility = {}
     for instance in depsgraph.object_instances:
         obj = instance.object
         if obj.type not in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}:
@@ -1324,7 +1468,8 @@ def export_scene(depsgraph, scene, out_dir, width, height, settings):
             volumes.append(volume_json(obj, instance.matrix_world.copy(), volume, name))
             continue
         add_mesh_instance(writer, obj, instance.matrix_world.copy(), overrides, name)
-    sun, lights = lights_json(depsgraph, writer, overrides, warnings)
+        record_visibility(visibility, obj, name)
+    sun, lights = lights_json(depsgraph, writer, overrides, warnings, visibility)
     gltf = writer.write("scene")
     warnings.extend(writer.warnings)
 
@@ -1336,6 +1481,7 @@ def export_scene(depsgraph, scene, out_dir, width, height, settings):
         "world": world,
         "lights": lights,
         "materials": overrides,
+        "visibility": visibility,
         "render": {
             "width": width, "height": height,
             "samples": settings.samples, "bounces": settings.bounces,
