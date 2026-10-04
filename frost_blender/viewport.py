@@ -38,6 +38,8 @@ class Session:
     def start(self, gltf, setup):
         self.stop()
         command = [self.frost, gltf, "--setup", setup, "--interactive", self.frame_path]
+        if properties.frost_speaks_linear(self.frost):
+            command.append("--linear")   # the frame is drawn in display space, so it has to be light
         engine_module.log("viewport: " + " ".join(command))
         self.errors = open(os.path.join(self.work, "frost-stderr.log"), "w")
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -72,20 +74,16 @@ class Session:
                 data = f.read()
         except OSError:
             return None
-        if len(data) < 16 or data[:4] != b"FRSN":
+        if len(data) < 16 or int.from_bytes(data[12:16], "little") == self.sequence_seen:
             return None
-        w = int.from_bytes(data[4:8], "little")
-        h = int.from_bytes(data[8:12], "little")
-        sequence = int.from_bytes(data[12:16], "little")
-        if sequence == self.sequence_seen or len(data) < 16 + w * h * 4:
+        frame = engine_module.decode_frame(data)
+        if frame is None:
             return None
+        w, h, sequence, rgba = frame
         self.sequence_seen = sequence
         self.frames_seen += 1
         if self.frames_seen == 1:
             engine_module.log("viewport: first frame %dx%d after %.2f s" % (w, h, time.time() - self.started_at))
-        bgra = np.frombuffer(data, dtype=np.uint8, count=w * h * 4, offset=16).reshape(h, w, 4)
-        rgb = engine_module._SRGB_TO_LINEAR[bgra[::-1, :, 2::-1]]
-        rgba = np.concatenate([rgb, np.ones((h, w, 1), dtype=np.float32)], axis=2)
         return sequence, w, h, np.ascontiguousarray(rgba)
 
     def stop(self):
@@ -164,6 +162,18 @@ def start_session(engine, context, depsgraph):
     scene = depsgraph.scene_eval
     work = tempfile.mkdtemp(prefix="frost-view-")
     settings = scene.frost
+    # A world Frost cannot read as it is has to be baked, and the Rendered
+    # viewport never passed through anything that did: it showed a plain grey
+    # lighting a studio from every side. The bake runs in a second Blender
+    # beside this one, and the session is started again the moment it lands.
+    try:
+        from . import bake
+        original = getattr(scene, "original", scene)
+        if settings.auto_bake and getattr(engine, "world_bake", None) is None and bake.world_needs_bake(original):
+            engine.world_bake = bake.start_world_bake(original)
+            engine_module.log("viewport: baking the world")
+    except Exception as error:
+        engine_module.log("viewport: the world bake did not start: %s" % error)
     try:
         gltf, setup, warnings = export.export_scene(depsgraph, scene, work, 64, 64, settings)
     except Exception as error:
@@ -190,6 +200,15 @@ def redraw_when_frames_arrive(engine_ref, session):
         if due is not None and time.time() >= due:
             engine.restart_session()
             return None
+        baking = getattr(engine, "world_bake", None)
+        if baking is not None and baking[0].poll() is not None:
+            # The world's picture is in the cache: start again with it.
+            from . import bake
+            engine.world_bake = None
+            if bake.finish_world_bake(baking, engine_module.log):
+                engine_module.log("viewport: the world is baked")
+                engine.restart_session()
+                return None
         try:
             mtime = os.path.getmtime(session.frame_path)
         except OSError:

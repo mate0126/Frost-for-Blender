@@ -340,7 +340,7 @@ def uv_mapped(node):
 
 PLAIN_SURFACE = {"base": (0.8, 0.8, 0.8), "roughness": 0.5, "metallic": 0.0, "normal": None,
                  "emission": (0.0, 0.0, 0.0), "strength": 0.0, "transmission": 0.0, "ior": 1.45,
-                 "alpha": 1.0,
+                 "alpha": 1.0, "specular_level": 0.5, "gloss_layer": False,
                  # The layers. A product material is not a base colour and a
                  # roughness: it is a varnish over a substrate, a fibre lobe,
                  # a metal's measured index, a medium with a depth. All of it
@@ -349,7 +349,7 @@ PLAIN_SURFACE = {"base": (0.8, 0.8, 0.8), "roughness": 0.5, "metallic": 0.0, "no
                  "coat": 0.0, "coat_roughness": 0.03, "coat_ior": 1.5, "coat_tint": (1.0, 1.0, 1.0),
                  "sheen": 0.0, "sheen_roughness": 0.3, "sheen_tint": (1.0, 1.0, 1.0),
                  "anisotropy": 0.0, "aniso_rotation": 0.0, "aniso_mode": 0,
-                 "conductor_n": None, "conductor_k": None,
+                 "conductor_n": None, "conductor_k": None, "edge_tint": None,
                  "absorption": None, "absorption_depth": 0.0, "thin_walled": False}
 
 
@@ -431,6 +431,7 @@ def shader_surface(node, depth=0):
                         "strength": socket(node, "Emission Strength"),
                         "transmission": socket(node, "Transmission Weight", "Transmission"),
                         "ior": socket(node, "IOR"), "alpha": socket(node, "Alpha"),
+                        "specular_level": socket(node, "Specular IOR Level", "Specular"),
                         "coat": socket(node, "Coat Weight", "Clearcoat"),
                         "coat_roughness": socket(node, "Coat Roughness", "Clearcoat Roughness"),
                         "coat_ior": socket(node, "Coat IOR"),
@@ -442,7 +443,8 @@ def shader_surface(node, depth=0):
                         "aniso_rotation": socket(node, "Anisotropic Rotation"),
                         "aniso_mode": tangent_mode(node)})
     elif kind == 'BSDF_DIFFUSE':
-        surface.update({"base": socket(node, "Color"), "roughness": 0.9, "normal": socket(node, "Normal")})
+        surface.update({"base": socket(node, "Color"), "roughness": 0.9, "normal": socket(node, "Normal"),
+                        "specular_level": 0.0})   # nothing but the diffuse lobe: no highlight at all
     elif kind in ('BSDF_GLOSSY', 'BSDF_METALLIC'):
         surface.update({"base": socket(node, "Color", "Base Color"), "metallic": 1.0,
                         "roughness": socket(node, "Roughness"), "normal": socket(node, "Normal"),
@@ -459,10 +461,19 @@ def shader_surface(node, depth=0):
             if n is not None and k is not None:
                 surface["conductor_n"] = tuple(float(c) for c in n)[:3]
                 surface["conductor_k"] = tuple(float(c) for c in k)[:3]
+        elif getattr(node, "fresnel_type", "") == 'F82':
+            # An alloy, or a metal seen through a dye -- an anodised part --
+            # has no measurement to quote and states its reflectance face-on
+            # and at 82 degrees instead. Schlick alone cannot dip there, which
+            # is the darkening that makes black anodise read as anodised
+            # aluminium rather than black plastic.
+            edge = colour_of(socket(node, "Edge Tint"), None)
+            if edge is not None:
+                surface["edge_tint"] = tuple(float(c) for c in edge)[:3]
         # A Glossy on its own is a mirror; mixed over something else it is
         # the coat on it, which is a different surface entirely.
         if kind == 'BSDF_GLOSSY':
-            surface["coat"] = True
+            surface["gloss_layer"] = True
     elif kind == 'EMISSION':
         surface.update({"base": (0.0, 0.0, 0.0), "emission": socket(node, "Color"),
                         "strength": socket(node, "Strength")})
@@ -485,6 +496,9 @@ def shader_surface(node, depth=0):
             fac = 0.5
         else:
             fac_socket = node.inputs[0] if node.inputs and node.inputs[0].type != 'SHADER' else None
+            layered = fresnel_layers(node, fac_socket, shaders, parts)
+            if layered is not None:
+                return layered
             fac = 0.5 if fac_socket is None or fac_socket.is_linked else float(fac_socket.default_value)
         return blend_surfaces(parts[0], parts[1], max(0.0, min(1.0, fac)))
     elif kind == 'GROUP' and node.node_tree is not None:
@@ -494,6 +508,48 @@ def shader_surface(node, depth=0):
                     if inp.type == 'SHADER' and inp.is_linked:
                         return shader_surface(inp.links[0].from_node, depth + 1)
     return surface
+
+
+def fresnel_layers(node, fac_socket, shaders, parts):
+    """A Mix Shader whose factor is a Fresnel node is not a blend: it is one
+    surface, built by hand as the layers it has. The gloss goes on by the
+    angle and whatever is under it shows through the rest of the time --
+
+    * over a Transparent, it is thin-walled glass: a pane, a display cover,
+      a bottle with no thickness. Light reflects by Fresnel or carries
+      straight on, tinted once by the Transparent's colour.
+    * over anything else, it is that surface with a dielectric gloss on it,
+      at the Fresnel node's index.
+
+    Read as a half-and-half mix, a black mirror glass came out half
+    transparent and half metal, and the camera saw the grey part inside it
+    through every other ray."""
+    if fac_socket is None or not fac_socket.is_linked or len(shaders) < 2:
+        return None
+    source = fac_socket.links[0].from_node
+    if source.type == 'FRESNEL':
+        ior = number_of(socket(source, "IOR"), 1.5)
+    elif source.type == 'LAYER_WEIGHT' and fac_socket.links[0].from_socket.name == 'Fresnel':
+        # Layer Weight states the same curve by a blend: 0.5 is an index of 2.
+        blend = min(max(number_of(socket(source, "Blend"), 0.5), 0.0), 0.99)
+        ior = 1.0 / max(1.0 - blend, 1e-3)
+    else:
+        return None
+    kinds = [s.links[0].from_node.type if s.is_linked else None for s in shaders[:2]]
+    under, gloss = parts[0], parts[1]     # the factor is the second shader's share
+    if kinds[1] not in ('BSDF_GLOSSY', 'BSDF_METALLIC'):
+        return None
+    out = dict(under)
+    out["roughness"] = gloss["roughness"]
+    if gloss.get("normal") is not None:
+        out["normal"] = gloss["normal"]
+    out["metallic"] = 0.0
+    out["ior"] = ior
+    out["specular_level"] = 0.5
+    out["gloss_layer"] = False
+    if kinds[0] == 'BSDF_TRANSPARENT':
+        out.update({"transmission": 1.0, "thin_walled": True, "alpha": 1.0})
+    return out
 
 
 def blend_surfaces(a, b, fac):
@@ -506,7 +562,7 @@ def blend_surfaces(a, b, fac):
     # how nearly every Blender file says "partly there", and it is alpha 0 on
     # one side of the mix.
     for key, fallback in (("roughness", 0.5), ("metallic", 0.0), ("transmission", 0.0), ("ior", 1.45),
-                          ("alpha", 1.0)):
+                          ("alpha", 1.0), ("specular_level", 0.5)):
         out[key] = number_of(a[key], fallback) * (1.0 - fac) + number_of(b[key], fallback) * fac
     # A Glossy mixed over something that is not metal is the shine on it,
     # not a part-metal: blended as metal the highlight takes the surface's
@@ -514,13 +570,18 @@ def blend_surfaces(a, b, fac):
     # material in any file without a Principled -- rendered flat matte.
     # Kept as a dielectric at the coat's own roughness, the highlight is
     # white and sharp, which is what Cycles draws.
-    coats = [s for s in (a, b) if s.get("coat")]
-    plains = [s for s in (a, b) if not s.get("coat")]
+    # `gloss_layer` is a Glossy BSDF standing as the shine on something, and
+    # is not the Principled's coat, which is `coat` and a weight. One name for
+    # both gave every plain Glossy a full clearcoat.
+    coats = [s for s in (a, b) if s.get("gloss_layer")]
+    plains = [s for s in (a, b) if not s.get("gloss_layer")]
     if len(coats) == 1 and len(plains) == 1 and number_of(plains[0]["metallic"], 0.0) < 0.5:
         out["base"] = plains[0]["base"]
         out["metallic"] = 0.0
         out["roughness"] = number_of(coats[0]["roughness"], 0.1)
-        out["coat"] = False
+        out["gloss_layer"] = False
+        for key in ("coat", "coat_roughness", "coat_ior", "coat_tint"):
+            out[key] = plains[0][key]
     if not is_socket(a["base"]) and not is_socket(b["base"]):
         ca, cb = colour_of(a["base"], (0.8, 0.8, 0.8)), colour_of(b["base"], (0.8, 0.8, 0.8))
         out["base"] = tuple(ca[i] * (1.0 - fac) + cb[i] * fac for i in range(3))
@@ -669,9 +730,13 @@ def graph_stamp(tree, extra=""):
             if ramp is not None:
                 parts.append(";".join("%.4f:%s" % (e.position, ",".join("%.4f" % c for c in e.color))
                                       for e in ramp.elements))
-        for link in tree.links:
-            parts.append("%s.%s>%s.%s" % (link.from_node.name, link.from_socket.identifier,
-                                          link.to_node.name, link.to_socket.identifier))
+        # In a fixed order: which wire was drawn last is not part of what a
+        # graph is. Taking a wire out and putting it back -- which the world's
+        # bake does to its Light Path node -- moved it to the end of the list,
+        # and the graph no longer matched the bake just made of it.
+        parts.extend(sorted("%s.%s>%s.%s" % (link.from_node.name, link.from_socket.identifier,
+                                             link.to_node.name, link.to_socket.identifier)
+                            for link in tree.links))
     return hashlib.sha1("\n".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -694,7 +759,7 @@ def world_source(world):
 
 # Bumped when the world baker itself changes, so a picture baked by an
 # older one is made again rather than trusted.
-WORLD_BAKE_VERSION = "4"
+WORLD_BAKE_VERSION = "5"   # 5: Light Path outputs pinned, not muted
 
 
 def world_stamp(scene):
@@ -819,9 +884,36 @@ def material_json(writer, material, overrides):
         writer.extensions_used.update({"KHR_materials_transmission", "KHR_materials_ior"})
         overrides.setdefault(material.name, {}).update({"transmission": transmission, "ior": ior})
 
-    # The layers glTF has no vocabulary for. They ride in the setup's material
-    # overrides, which is where everything the format cannot say already goes.
+    extra = analytic_layers(surface, material)
+    if extra and material is not None:
+        overrides.setdefault(material.name, {}).update(extra)
+    return entry
+
+
+def analytic_layers(surface, material):
+    """What a surface does with the angle, which no picture can hold.
+
+    A bake captures where a surface varies -- its colour, its roughness, its
+    relief -- and nothing about how it answers the eye: a conductor's Fresnel
+    curve, a varnish's index and tint, a fibre lobe, which way a part was
+    brushed, what its medium does over a depth. Baking a material therefore
+    has to keep these rather than replace them, or an anodised part comes
+    back as a photograph of one."""
     extra = {}
+    # How much a non-metal reflects face-on, which is its index and nothing
+    # else: ((n - 1) / (n + 1))^2, scaled by the Principled's Specular IOR
+    # Level (a half leaves it alone). Unsent, every surface had glass's four
+    # percent whatever it was -- and a backdrop given an index of 1 so that it
+    # reflects nothing at all came out as a grey wall under the softboxes.
+    # Frost states it as a fraction of the eight percent a dielectric can
+    # manage, so a half is the ordinary 1.5.
+    if number_of(surface["metallic"], 0.0) < 0.999 and number_of(surface["transmission"], 0.0) <= 0.0:
+        ior = max(number_of(surface["ior"], 1.5), 1.0)
+        level = max(number_of(surface.get("specular_level", 0.5), 0.5), 0.0)
+        f0 = ((ior - 1.0) / (ior + 1.0)) ** 2 * 2.0 * level
+        specular = f0 / 0.08
+        if abs(specular - 0.5) > 0.01:
+            extra["specular"] = specular
     coat = number_of(surface["coat"], 0.0)
     if coat > 0.0:
         extra.update({"coat": coat,
@@ -845,12 +937,14 @@ def material_json(writer, material, overrides):
     if surface["conductor_n"] is not None:
         extra["conductor_n"] = list(surface["conductor_n"])
         extra["conductor_k"] = list(surface["conductor_k"])
+    if surface["edge_tint"] is not None:
+        extra["edge_tint"] = list(surface["edge_tint"])
     medium = material_medium(material)
     if medium is not None:
         extra["absorption"], extra["absorption_depth"] = medium
-    if extra and material is not None:
-        overrides.setdefault(material.name, {}).update(extra)
-    return entry
+    if surface.get("thin_walled"):
+        extra["thin_walled"] = True
+    return extra
 
 
 def material_medium(material):
@@ -907,6 +1001,10 @@ def baked_material_slot(writer, material, entry, owner, overrides):
     index = writer.image_file(entry.get("color"))
     if index is not None:
         pbr["baseColorTexture"] = {"index": index}
+    elif entry.get("color_value") is not None:
+        # Nothing drives the colour, so it was never a picture: the number.
+        value = entry["color_value"]
+        pbr["baseColorFactor"] = [float(value[0]), float(value[1]), float(value[2]), 1.0]
     index = writer.image_file(entry.get("roughness"))
     if index is not None:
         # The bake packs roughness in green and the metallic value in blue.
@@ -934,6 +1032,12 @@ def baked_material_slot(writer, material, entry, owner, overrides):
         result["extensions"]["KHR_materials_ior"] = {"ior": ior}
         writer.extensions_used.update({"KHR_materials_transmission", "KHR_materials_ior"})
         overrides.setdefault(key, {}).update({"transmission": transmission, "ior": ior})
+    # The bake holds where the surface varies; these hold how it answers the
+    # eye, and nothing in a picture can carry them.
+    if material is not None and output_shader(material) is not None:
+        layers = analytic_layers(surface_of(material), material)
+        if layers:
+            overrides.setdefault(key, {}).update(layers)
     writer.materials.append(result)
     writer.material_index[key] = len(writer.materials) - 1
     return writer.material_index[key]
@@ -1107,14 +1211,31 @@ def add_mesh_data(writer, obj, overrides, name):
 
 
 def add_area_light(writer, light, matrix, overrides, name):
-    """An area light as the emissive quad it is: Frost samples emissive
+    """An area light as the emissive panel it is: Frost samples emissive
     geometry directly, and a Lambertian emitter of power P over area A has
-    the radiance P / (pi A)."""
+    the radiance P / (pi A).
+
+    The area is the panel's as it stands in the scene, not the lamp's own
+    Size. A softbox is a one-metre lamp scaled up to four, and scaling a lamp
+    spreads the same watts over a bigger panel; taken from the Size alone,
+    the radiance was for one square metre and the panel drawn was seventeen,
+    so the lamp put out seventeen times its power. A disc or an ellipse is
+    drawn as one, since the shape is what shows in every glossy thing it
+    lights."""
     size_x = float(light.size)
     size_y = float(light.size_y) if light.shape in {'RECTANGLE', 'ELLIPSE'} else size_x
-    area = size_x * size_y
+    hx, hy = size_x * 0.5, size_y * 0.5
     if light.shape in {'DISK', 'ELLIPSE'}:
-        area *= math.pi / 4.0
+        sides = 32
+        ring = [Vector((hx * math.cos(2.0 * math.pi * i / sides), hy * math.sin(2.0 * math.pi * i / sides), 0.0))
+                for i in range(sides)]
+    else:
+        ring = [Vector((-hx, -hy, 0.0)), Vector((hx, -hy, 0.0)), Vector((hx, hy, 0.0)), Vector((-hx, hy, 0.0))]
+    world = [matrix @ corner for corner in ring]
+    # The panel's area where it stands: a fan of triangles round its first corner.
+    area = 0.0
+    for i in range(1, len(world) - 1):
+        area += 0.5 * (world[i] - world[0]).cross(world[i + 1] - world[0]).length
     if area <= 1e-9:
         return
     radiance = float(light.energy) / (math.pi * area)
@@ -1129,28 +1250,32 @@ def add_area_light(writer, light, matrix, overrides, name):
     writer.extensions_used.add("KHR_materials_emissive_strength")
     writer.material_index[material_name] = len(writer.materials) - 1
     overrides[material_name] = {"emission": colour, "emission_strength": radiance}
-    hx, hy = size_x * 0.5, size_y * 0.5
-    corners = [Vector((-hx, -hy, 0.0)), Vector((hx, -hy, 0.0)), Vector((hx, hy, 0.0)), Vector((-hx, hy, 0.0))]
     normal_matrix = matrix.to_3x3().inverted_safe().transposed()
     n = to_frost((normal_matrix @ Vector((0.0, 0.0, -1.0))).normalized())
-    positions, normals = [], []
+    positions, normals, uvs = [], [], []
     low = [1e30] * 3
     high = [-1e30] * 3
-    for corner in corners:
-        p = to_frost(matrix @ corner)
+    for corner, local in zip(world, ring):
+        p = to_frost(corner)
         positions.extend(p)
         normals.extend(n)
+        uvs.extend((local.x / max(size_x, 1e-9) + 0.5, local.y / max(size_y, 1e-9) + 0.5))
         for axis in range(3):
             low[axis] = min(low[axis], p[axis])
             high[axis] = max(high[axis], p[axis])
-    indices = [0, 2, 1, 0, 3, 2]
+    count = len(world)
+    indices = []
+    for i in range(1, count - 1):
+        indices.extend((0, i + 1, i))       # wound to face the way the lamp shines
     primitive = {
         "attributes": {
-            "POSITION": writer.accessor(struct.pack("<12f", *positions), 4, GLTF_FLOAT, "VEC3", ARRAY_BUFFER, (low, high)),
-            "NORMAL": writer.accessor(struct.pack("<12f", *normals), 4, GLTF_FLOAT, "VEC3", ARRAY_BUFFER),
-            "TEXCOORD_0": writer.accessor(struct.pack("<8f", 0, 0, 1, 0, 1, 1, 0, 1), 4, GLTF_FLOAT, "VEC2", ARRAY_BUFFER),
+            "POSITION": writer.accessor(struct.pack("<%df" % (count * 3), *positions), count, GLTF_FLOAT, "VEC3",
+                                        ARRAY_BUFFER, (low, high)),
+            "NORMAL": writer.accessor(struct.pack("<%df" % (count * 3), *normals), count, GLTF_FLOAT, "VEC3", ARRAY_BUFFER),
+            "TEXCOORD_0": writer.accessor(struct.pack("<%df" % (count * 2), *uvs), count, GLTF_FLOAT, "VEC2", ARRAY_BUFFER),
         },
-        "indices": writer.accessor(struct.pack("<6I", *indices), 6, GLTF_UINT, "SCALAR", ELEMENT_ARRAY_BUFFER),
+        "indices": writer.accessor(struct.pack("<%dI" % len(indices), *indices), len(indices), GLTF_UINT, "SCALAR",
+                                   ELEMENT_ARRAY_BUFFER),
         "mode": 4,
         "material": writer.material_index[material_name],
     }
@@ -1440,7 +1565,10 @@ def lights_json(depsgraph, writer, overrides, warnings, visibility):
             lights.append(entry)
         elif light.type == 'AREA':
             add_area_light(writer, light, matrix, overrides, obj.name)
-            record_visibility(visibility, obj, obj.name)
+            # A lamp is light and nothing else: it has no body to cast a
+            # shadow with, whatever its object's Shadow box says. The quad it
+            # goes over as must not put one softbox in the shade of another.
+            visibility[obj.name] = {"camera": bool(getattr(obj, "visible_camera", True)), "shadow": False}
     return sun, lights
 
 

@@ -15,6 +15,9 @@
 import hashlib
 import math
 import os
+import tempfile
+import subprocess
+import shutil
 import time
 
 import bpy
@@ -29,8 +32,15 @@ BAKE_KEY = export.BAKE_KEY
 WORLD_KEY = export.WORLD_KEY
 
 # (our name, Cycles' bake type, what the picture holds)
-PASSES = (("color", 'DIFFUSE', 'sRGB'), ("roughness", 'ROUGHNESS', 'Non-Color'),
+# The colour is baked as an emission of whatever drives Base Color, not as
+# Cycles' DIFFUSE pass: a metal has no diffuse, so every metallic material's
+# colour came back black -- a mirror with nothing to reflect, which is what an
+# anodised part, a brushed panel and a gold trim all baked to.
+PASSES = (("color", 'EMIT', 'sRGB'), ("roughness", 'ROUGHNESS', 'Non-Color'),
           ("normal", 'NORMAL', 'Non-Color'), ("emit", 'EMIT', 'sRGB'))
+# Bakes made by an older baker are made again: 2 is the colour from the
+# socket rather than from the diffuse pass, 3 is sixteen samples a texel.
+OBJECT_BAKE_VERSION = "3"
 
 
 def bake_size_for(obj, base):
@@ -54,7 +64,8 @@ def bake_size_for(obj, base):
 def object_stamp(obj, size, material_stamps=None):
     """What the object's bake was made from: its materials' graphs, its
     mesh, the size. A bake whose stamp no longer matches is baked again."""
-    parts = ["size=%d" % size, "verts=%d" % (len(obj.data.vertices) if obj.data is not None else 0)]
+    parts = ["bake=%s" % OBJECT_BAKE_VERSION, "size=%d" % size,
+             "verts=%d" % (len(obj.data.vertices) if obj.data is not None else 0)]
     for slot in obj.material_slots:
         material = slot.material
         if material is None:
@@ -112,6 +123,70 @@ def world_needs_bake(scene):
 world_folder = export.world_folder
 
 
+def blend_stem():
+    return bpy.path.clean_name(os.path.splitext(os.path.basename(bpy.data.filepath))[0]) or "untitled"
+
+
+def start_world_bake(scene):
+    """Starts the world's bake in a second, headless Blender and returns
+    (process, the folder to remove after), or None when there is nothing to
+    start.
+
+    The bake is a Cycles render of the sky, and a render cannot start a
+    render: inside RenderEngine.render no operator has a context to run in.
+    So the bake hung off the F12 operator, and a render started any other
+    way -- Render > Render Image, a script, another add-on's button, the
+    Rendered viewport -- went out with a plain grey for a world: a studio lit
+    from every side at once, which looks nothing like the scene and says so
+    only in a log. The world alone is written to a file of its own and baked
+    from there, so it does not matter who started the render or whether the
+    project was ever saved. The picture lands in the same cache under the
+    same stamp, which is where every session looks."""
+    original = getattr(scene, "original", scene)
+    world = original.world
+    if world is None:
+        return None
+    work = tempfile.mkdtemp(prefix="frost-world-")
+    blend = os.path.join(work, "world.blend")
+    try:
+        bpy.data.libraries.write(blend, {world}, fake_user=True, path_remap='ABSOLUTE')
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bake_world_cli.py")
+    command = [bpy.app.binary_path, "-b", "--factory-startup", blend, "--python", script, "--",
+               world.name, export.world_stamp(original), blend_stem(),
+               "1" if original.render.film_transparent else "0"]
+    # Into a file rather than a pipe: the viewport does not sit reading it,
+    # and a pipe nobody reads fills, and the bake stops with it.
+    output = open(os.path.join(work, "bake.log"), "w")
+    process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+    output.close()
+    return process, work
+
+
+def finish_world_bake(started, log=None):
+    """Waits for a bake started above; True when the picture is there."""
+    process, work = started
+    output = ""
+    try:
+        process.wait(timeout=300)
+        with open(os.path.join(work, "bake.log"), errors="replace") as f:
+            output = f.read()
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output = "timed out"
+    except OSError:
+        pass
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    ok = process.returncode == 0 and "frost world baked" in (output or "")
+    if not ok and log is not None:
+        tail = [line for line in (output or "").splitlines() if line.strip()][-4:]
+        log("the world could not be baked: " + " / ".join(tail))
+    return ok
+
+
 def save_linear_exr(pixels, width, height, path):
     """Float RGBA rows, from the bottom up as Blender keeps them, written
     as a plain OpenEXR tagged linear."""
@@ -162,7 +237,69 @@ def flat_colour(pixels):
     return [float(c) for c in (low + high) * 0.5]
 
 
-def bake_world(scene, folder):
+# What a Light Path node says to a ray that carries light onto a surface
+# rather than a picture to the camera.
+LIGHTING_RAY = {"Is Camera Ray": 0.0, "Is Shadow Ray": 0.0, "Is Diffuse Ray": 1.0, "Is Glossy Ray": 0.0,
+                "Is Singular Ray": 0.0, "Is Reflection Ray": 1.0, "Is Transmission Ray": 0.0,
+                "Is Volume Scatter Ray": 0.0, "Ray Length": 1.0, "Ray Depth": 1.0, "Diffuse Depth": 1.0,
+                "Glossy Depth": 0.0, "Transparent Depth": 0.0, "Transmission Depth": 0.0, "Portal Depth": 0.0}
+
+
+def pin_light_paths(tree, seen=None):
+    """Unhooks every Light Path output in the tree and holds what it fed at
+    the value a lighting ray would have given it; returns what to put back.
+
+    Muting the node is the obvious way to take the camera out of a world,
+    and it does not do that: a muted node with nothing to pass through
+    leaves whatever it fed at that socket's own default, and a Mix's factor
+    defaults to a half. Every studio world -- one thing for the camera,
+    another for the light -- was baked as half of each: lit at half its
+    strength, with half of the backdrop mixed into the light."""
+    pinned = []
+    if tree is None:
+        return pinned
+    seen = seen if seen is not None else set()
+    if tree.name in seen:
+        return pinned
+    seen.add(tree.name)
+    for node in tree.nodes:
+        if node.type == 'GROUP' and node.node_tree is not None:
+            pinned.extend(pin_light_paths(node.node_tree, seen))
+        if node.type != 'LIGHT_PATH':
+            continue
+        for output in node.outputs:
+            value = LIGHTING_RAY.get(output.name, 0.0)
+            for link in list(output.links):
+                source, target = link.from_socket, link.to_socket
+                if not hasattr(target, "default_value"):
+                    continue
+                before = target.default_value
+                try:
+                    before = tuple(before)
+                except TypeError:
+                    pass
+                tree.links.remove(link)
+                try:
+                    if isinstance(before, tuple):
+                        target.default_value = tuple([value] * 3 + [1.0])[:len(before)]
+                    else:
+                        target.default_value = value
+                except (TypeError, ValueError):
+                    pass
+                pinned.append((tree, source, target, before))
+    return pinned
+
+
+def unpin_light_paths(pinned):
+    for tree, source, target, before in pinned:
+        try:
+            target.default_value = before
+            tree.links.new(source, target)
+        except Exception:
+            pass
+
+
+def bake_world(scene, folder, stamp=None, stem=None):
     """The world alone, rendered by Cycles as an equirectangular picture of
     the sky and recorded on the scene, so Frost lights the scene with the
     very same sky and shows it behind: a Sky Texture, a graph of colour
@@ -180,8 +317,9 @@ def bake_world(scene, folder):
     A world that shows one thing to the camera and another to everything
     else -- a Light Path node into a Mix, which is how a studio backdrop is
     made black behind the product while the softboxes still light it -- is
-    baked twice. Once with those nodes muted, which is what lights the
-    scene and becomes the sky; and once as the world stands, which is what
+    baked twice. Once with those nodes held at what a lighting ray gives
+    them (`pin_light_paths`), which is what lights the scene and becomes
+    the sky; and once as the world stands, which is what
     the camera sees and becomes the backdrop: a colour when it is one
     colour, a picture when it is not. Baking the lighting branch alone hung
     the softbox rig itself behind the product -- "it just puts in skies that
@@ -193,13 +331,14 @@ def bake_world(scene, folder):
     background, source = export.world_source(world)
     if background is None:
         return None
-    stem = bpy.path.clean_name(os.path.splitext(os.path.basename(bpy.data.filepath))[0]) or "untitled"
-    stamp = export.world_stamp(scene)
+    # Given when this is a second Blender baking on another's behalf: the
+    # stamp is the asking session's, so that session finds the picture.
+    stem = stem or blend_stem()
+    stamp = stamp or export.world_stamp(scene)
     path = os.path.join(folder, "%s-%s-%s.exr" % (stem, bpy.path.clean_name(world.name), stamp))
     width, height = 2048, 1024
     tree = world.node_tree
-    light_paths = [node for node in tree.nodes if node.type == 'LIGHT_PATH'] if tree is not None else []
-    muted = []
+    pinned = []
     temp = bpy.data.scenes.new("Frost World Bake")
     camera_data = bpy.data.cameras.new("Frost World Camera")
     camera = bpy.data.objects.new("Frost World Camera", camera_data)
@@ -233,22 +372,20 @@ def bake_world(scene, folder):
         camera.rotation_euler = (math.pi / 2.0, 0.0, -math.pi / 2.0)
         record = {"stamp": stamp, "image": path, "when": time.strftime("%Y-%m-%d %H:%M")}
 
-        # What lights the scene.
-        for node in light_paths:
-            if not node.mute:
-                node.mute = True
-                muted.append(node)
-        save_linear_exr(world_panorama(temp, width, height, path), width, height, path)
+        # What lights the scene: the world as a ray that is not the camera's
+        # finds it.
+        pinned = pin_light_paths(tree)
+        try:
+            save_linear_exr(world_panorama(temp, width, height, path), width, height, path)
+        finally:
+            unpin_light_paths(pinned)
 
         # And what the camera sees, when the project says that is something
         # else. A transparent film says it too: Frost has no alpha channel,
         # and black is what a transparent film is composited over.
         if scene.render.film_transparent:
             record["backdrop_color"] = [0.0, 0.0, 0.0]
-        elif muted:
-            for node in muted:
-                node.mute = False
-            del muted[:]
+        elif pinned:
             seen = world_panorama(temp, width, height, path + ".backdrop")
             colour = flat_colour(seen)
             if colour is not None:
@@ -263,8 +400,6 @@ def bake_world(scene, folder):
         export.manifest_write(folder, stamp, record)
         return record
     finally:
-        for node in muted:
-            node.mute = False
         try:
             bpy.data.scenes.remove(temp)
             bpy.data.objects.remove(camera)
@@ -360,6 +495,41 @@ def metal_ready():
         return False
 
 
+def emit_base_colour(targets, colour_sources):
+    """Rewires each material to emit whatever drives its Base Color, so an
+    EMIT bake is a bake of that socket and nothing else -- no lighting, no
+    diffuse-or-metal question. Returns what to put back."""
+    rewired = []
+    for index, material, _, _, _ in targets:
+        tree = material.node_tree
+        output = next((n for n in tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+        if output is None:
+            continue
+        surface = output.inputs["Surface"]
+        original = surface.links[0].from_socket if surface.is_linked else None
+        emission = tree.nodes.new('ShaderNodeEmission')
+        emission.name = "Frost Bake Colour"
+        emission.inputs["Strength"].default_value = 1.0
+        source = colour_sources.get(index)
+        if source is not None:
+            tree.links.new(source, emission.inputs["Color"])
+        else:
+            emission.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+        tree.links.new(emission.outputs[0], surface)
+        rewired.append((tree, output, original, emission))
+    return rewired
+
+
+def restore_surfaces(rewired):
+    for tree, output, original, emission in rewired:
+        try:
+            if original is not None:
+                tree.links.new(original, output.inputs["Surface"])
+            tree.nodes.remove(emission)
+        except Exception:
+            pass
+
+
 def bake_object(scene, obj, size, folder):
     """Bakes every material on the object into pictures of `size` and
     records them on the object. Returns the record, or raises."""
@@ -371,9 +541,14 @@ def bake_object(scene, obj, size, folder):
                   ("use_selected_to_active", "margin", "use_clear", "target", "use_pass_direct",
                    "use_pass_indirect", "use_pass_color", "normal_space")}
     scene.render.engine = 'CYCLES'
-    # A colour, a roughness or a normal has no noise in it: one sample a
-    # texel is the answer. On the GPU when the person's Cycles already uses it.
-    scene.cycles.samples = 1
+    # Sixteen samples a texel, not one. A bake has no lighting noise in it,
+    # but a procedural finish -- a blasted metal's speckle, a moulded
+    # plastic's grain -- varies well inside one texel, and one sample of it is
+    # one random draw: every texel a facet with its own tilt and tone, which
+    # renders as grit, brighter and rougher than the surface is. Averaged
+    # over the texel it is what a camera that far away sees. On the GPU when
+    # the person's Cycles already uses it.
+    scene.cycles.samples = 16
     scene.cycles.device = 'GPU' if metal_ready() else 'CPU'
     scene.cycles.use_denoising = False
     scene.cycles.use_adaptive_sampling = False
@@ -387,6 +562,7 @@ def bake_object(scene, obj, size, folder):
     bake.normal_space = 'TANGENT'
 
     targets = []   # (slot index, material, the temporary node, the picture, the node that was active)
+    colour_sources = {}   # slot index -> the socket that drives the material's Base Color
     wanted = set()   # the passes any material on the object needs
     record = {"uv": BAKE_UV, "size": size, "materials": {}, "when": time.strftime("%Y-%m-%d %H:%M"),
               "stamp": object_stamp(obj, size)}
@@ -418,8 +594,15 @@ def bake_object(scene, obj, size, folder):
             }
             # Only the passes the material needs: each one is a whole bake,
             # with the object's acceleration structure built again, and a
-            # million-triangle part spends most of its time there.
-            wanted.add("color")
+            # million-triangle part spends most of its time there. A colour
+            # nothing is wired into is a number, not a picture.
+            base = surface["base"]
+            if export.is_socket(base) and base.is_linked:
+                wanted.add("color")
+                colour_sources[index] = base.links[0].from_socket
+            else:
+                record["materials"][str(index)]["color_value"] = [
+                    float(c) for c in export.colour_of(base, (0.8, 0.8, 0.8))]
             if export.is_socket(surface["roughness"]) and surface["roughness"].is_linked:
                 wanted.add("roughness")
             if export.is_socket(surface["normal"]) and surface["normal"].is_linked:
@@ -435,10 +618,15 @@ def bake_object(scene, obj, size, folder):
             for _, _, node, picture, _ in targets:
                 picture.colorspace_settings.name = space
                 node.image = picture
-            bpy.ops.object.bake(type=kind, pass_filter={'COLOR'} if kind == 'DIFFUSE' else set(),
-                                margin=bake.margin, use_clear=True)
+            rewired = emit_base_colour(targets, colour_sources) if name == "color" else []
+            try:
+                bpy.ops.object.bake(type=kind, margin=bake.margin, use_clear=True)
+            finally:
+                restore_surfaces(rewired)
             for index, material, node, picture, _ in targets:
                 entry = record["materials"][str(index)]
+                if name == "color" and index not in colour_sources:
+                    continue
                 path = os.path.join(folder, "%s-%d-%s.png" % (stem, index, name))
                 pixels = np.empty(size * size * 4, dtype=np.float32)
                 picture.pixels.foreach_get(pixels)

@@ -76,6 +76,25 @@ def repair_executable(path):
     return os.access(path, os.X_OK)
 
 
+_LINEAR_SUPPORT = {}
+
+
+def frost_speaks_linear(frost):
+    """Whether this frost can hand its frames over as light (`--linear`).
+
+    The bundled one always can; a path set by hand, or an older FrioStudio's
+    copy, may not, and an option frost does not know is a render that does
+    not start. Asked once per executable."""
+    if frost not in _LINEAR_SUPPORT:
+        try:
+            import subprocess
+            out = subprocess.run([frost, "--help"], capture_output=True, text=True, timeout=10)
+            _LINEAR_SUPPORT[frost] = "--linear" in (out.stdout + out.stderr)
+        except Exception:
+            _LINEAR_SUPPORT[frost] = False
+    return _LINEAR_SUPPORT[frost]
+
+
 def find_frost(preferences=None):
     """Where frost is: the preference if set, the bundled copy, the one
     FrioStudio installed into the Terminal, or the one inside the app."""

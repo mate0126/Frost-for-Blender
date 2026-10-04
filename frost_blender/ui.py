@@ -64,20 +64,11 @@ class RENDER_PT_frost(bpy.types.Panel):
             box.label(text="Frost: " + frost, icon='CHECKMARK')
         else:
             box.label(text="Frost was not found; see the add-on's preferences.", icon='ERROR')
-        if context.scene.view_settings.view_transform != 'Standard':
-            box.label(text="Frost's frame is already tonemapped: use the Standard view transform.", icon='INFO')
-            box.operator("frost.standard_view", text="Use Standard")
-
-
-class FROST_OT_standard_view(bpy.types.Operator):
-    bl_idname = "frost.standard_view"
-    bl_label = "Use the Standard view transform"
-    bl_description = "Frost tonemaps its own frame; the Standard view shows it as rendered"
-
-    def execute(self, context):
-        context.scene.view_settings.view_transform = 'Standard'
-        context.scene.view_settings.look = 'None'
-        return {'FINISHED'}
+        if frost and not properties.frost_speaks_linear(frost):
+            # An older frost hands over a display image rather than light, and
+            # Blender's view transform then lands on top of Frost's own.
+            box.label(text="This frost is an older one: its frames are tonemapped twice.", icon='ERROR')
+            box.label(text="Use the copy that came with the add-on, or update FrioStudio.")
 
 
 def blender_panels():
@@ -104,7 +95,7 @@ def blender_panels():
     return panels
 
 
-classes = (RENDER_PT_frost, FROST_OT_standard_view)
+classes = (RENDER_PT_frost,)
 
 
 def register():

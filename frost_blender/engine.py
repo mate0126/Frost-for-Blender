@@ -44,24 +44,52 @@ def log(line):
 _SRGB_TO_LINEAR = png.srgb_to_linear(np.arange(256, dtype=np.uint8)).astype(np.float32)
 
 
+def decode_frame(data):
+    """One of frost's frame files as (width, height, sequence, rgba): float32,
+    scene-linear, rows from the bottom, which is how Blender wants a pass.
+
+    FRSL is the picture as light -- RGBA half floats, no tonemap -- and is
+    handed on as it is, so Blender's own view transform and exposure apply to
+    a Frost frame exactly as they do to a Cycles one. FRSN is the older
+    8-bit display image, from a frost that cannot do the other; undoing its
+    sRGB curve is the best that can be done with one, and it is still a
+    tonemapped picture."""
+    if len(data) < 16:
+        return None
+    magic = data[:4]
+    w = int.from_bytes(data[4:8], "little")
+    h = int.from_bytes(data[8:12], "little")
+    sequence = int.from_bytes(data[12:16], "little")
+    if w <= 0 or h <= 0:
+        return None
+    if magic == b"FRSL":
+        if len(data) < 16 + w * h * 8:
+            return None
+        halves = np.frombuffer(data, dtype=np.float16, count=w * h * 4, offset=16).reshape(h, w, 4)
+        rgba = halves[::-1].astype(np.float32)
+        rgba[:, :, 3] = 1.0
+        return w, h, sequence, rgba
+    if magic == b"FRSN":
+        if len(data) < 16 + w * h * 4:
+            return None
+        bgra = np.frombuffer(data, dtype=np.uint8, count=w * h * 4, offset=16).reshape(h, w, 4)
+        rgb = _SRGB_TO_LINEAR[bgra[::-1, :, 2::-1]]
+        return w, h, sequence, np.concatenate([rgb, np.ones((h, w, 1), dtype=np.float32)], axis=2)
+    return None
+
+
 def read_snapshot(path, width, height):
-    """frost's picture so far: a 16-byte header (FRSN, width, height,
-    sequence) and BGRA rows from the top. Returns the Combined pass's
-    floats, rows from the bottom, or None if the file is not there yet."""
+    """frost's picture so far, as the Combined pass's floats, or None if the
+    file is not there yet or is not this frame's size."""
     try:
         with open(path, "rb") as f:
             data = f.read()
     except OSError:
         return None
-    if len(data) < 16 or data[:4] != b"FRSN":
+    frame = decode_frame(data)
+    if frame is None or (frame[0], frame[1]) != (width, height):
         return None
-    w, h = int.from_bytes(data[4:8], "little"), int.from_bytes(data[8:12], "little")
-    if (w, h) != (width, height) or len(data) < 16 + w * h * 4:
-        return None
-    bgra = np.frombuffer(data, dtype=np.uint8, count=w * h * 4, offset=16).reshape(h, w, 4)
-    rgb = _SRGB_TO_LINEAR[bgra[::-1, :, 2::-1]]
-    rgba = np.concatenate([rgb, np.ones((h, w, 1), dtype=np.float32)], axis=2)
-    return rgba.reshape(-1)
+    return frame[3].reshape(-1)
 
 
 class FrostRenderEngine(bpy.types.RenderEngine):
@@ -192,6 +220,17 @@ class FrostRenderEngine(bpy.types.RenderEngine):
                 from . import bake
                 original = getattr(scene, "original", scene)
                 objects, world = bake.pending(original)
+                if world and original.frost.auto_bake:
+                    # The world is baked here, by a second Blender, rather than
+                    # left to whichever button started the render: a render
+                    # that came from the menu or a script used to go out lit
+                    # by a plain grey from every side.
+                    self.update_stats("Frost", "Baking the world")
+                    started = time.time()
+                    launched = bake.start_world_bake(original)
+                    if launched is not None and bake.finish_world_bake(launched, log):
+                        log("the world was baked in %.1f s" % (time.time() - started))
+                    objects, world = bake.pending(original)
                 if objects or world:
                     log("not baked: %d objects%s" % (len(objects), " and the world" if world else ""))
                     self.report({'WARNING'}, "%d object%s%s not baked for Frost; press F12 with Frost, or Bake Now"
@@ -238,6 +277,13 @@ class FrostRenderEngine(bpy.types.RenderEngine):
             out = os.path.join(work, "frame.png")
             snapshot_path = os.path.join(work, "progress.bgra")
             command = [frost, gltf, "--setup", setup, "--out", out, "--progress", snapshot_path]
+            # As light, not as a display image: Blender's view transform and
+            # exposure are part of how the scene was lit, and they have to be
+            # applied to Frost's frame once, by Blender, as they are to Cycles'.
+            if properties.frost_speaks_linear(frost):
+                command.append("--linear")
+            else:
+                log("this frost cannot hand its frame over as light; the picture is tonemapped twice")
             log("running: " + " ".join(command))
             self.update_stats("Frost", "Rendering")
             try:
