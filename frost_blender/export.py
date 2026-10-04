@@ -8,6 +8,8 @@
 # exporter does the same, which is why a file it writes and a file this
 # writes agree.
 
+ADDON_VERSION = (1, 1, 9)   # which release this module belongs to; __init__ checks it
+
 import hashlib
 import json
 import math

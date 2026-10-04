@@ -1,6 +1,8 @@
 # The Frost rows in Render Properties, and Blender's own material, light,
 # camera and world panels kept on when Frost is the engine.
 
+ADDON_VERSION = (1, 1, 9)   # which release this module belongs to; __init__ checks it
+
 import bpy
 
 from . import bake, properties

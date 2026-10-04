@@ -2,6 +2,8 @@
 # interlacing, decoded with zlib and numpy. Blender's render result loads
 # EXR files and nothing else, so the pixels are handed over directly.
 
+ADDON_VERSION = (1, 1, 9)   # which release this module belongs to; __init__ checks it
+
 import struct
 import zlib
 

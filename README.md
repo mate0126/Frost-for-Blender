@@ -108,6 +108,18 @@ default and answers a move four times sooner than full size. Orthographic
 views are not traced yet. The final render fills in bucket by bucket in
 the render window as it goes.
 
+**Material Preview** is Eevee's, exactly as it is with Cycles chosen: the
+scene under the viewport's own studio light. Frost draws **Rendered**.
+
+## Updating
+
+Install the new zip over the old one from Preferences > Add-ons > Install
+from Disk, with Blender open; the new version is running the moment it is
+installed. (Up to 1.1.8 it was not: Blender went on running the old code
+until it was restarted, and an update looked like it had changed nothing.)
+If Frost ever finds part of an older version still loaded it says so and
+asks for a restart.
+
 ## What it does not do yet
 
 - Orthographic viewports, and the camera frame's borders in camera view
@@ -121,9 +133,11 @@ the render window as it goes.
 
 ## The view transform
 
-Frost delivers a finished, tonemapped frame. Blender's **Standard** view
-transform shows it as rendered; AgX or Filmic would tonemap it a second
-time. The Frost panel offers a one-click switch.
+Frost hands Blender light, not a finished display picture, and Blender's
+colour management does the rest exactly once, the way it does for Cycles:
+AgX, Filmic, Standard, the look and the exposure all apply to a Frost
+frame as they do to a Cycles one, in the render window and in the Rendered
+viewport.
 
 ## Licensing
 

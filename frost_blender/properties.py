@@ -1,6 +1,8 @@
 # The render settings Frost has rows for, kept on the scene so they save
 # with the file, and the add-on's own preference: where frost is.
 
+ADDON_VERSION = (1, 1, 9)   # which release this module belongs to; __init__ checks it
+
 import os
 import platform
 import shutil

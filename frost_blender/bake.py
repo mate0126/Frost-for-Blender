@@ -12,6 +12,8 @@
 # ~/Library/Caches/Frost for Blender/bakes/<file>/, and named in a custom
 # property on the object (BAKE_KEY) that the export reads. Forget the Bakes
 # takes the property off; the UV map stays, since it does no harm.
+ADDON_VERSION = (1, 1, 9)   # which release this module belongs to; __init__ checks it
+
 import hashlib
 import math
 import os

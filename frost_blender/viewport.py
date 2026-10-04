@@ -1,9 +1,12 @@
 # The traced viewport: Blender's Rendered shading mode drawn by a frost
-# session that stays open. The scene is written out once (and again when
+# session that stays open. (Material Preview is Eevee's, as it is with any
+# engine that is not Eevee: see bl_use_eevee_viewport in engine.py.) The scene is written out once (and again when
 # it changes), frost loads it and waits; every time the view moves the
 # add-on sends the new camera down frost's stdin, frost starts the
 # accumulation again and writes the picture so far to a file after every
 # pass, and the add-on draws the latest one over the viewport.
+
+ADDON_VERSION = (1, 1, 9)   # which release this module belongs to; __init__ checks it
 
 import math
 import os
@@ -21,6 +24,9 @@ from mathutils import Vector
 
 from . import engine as engine_module
 from . import export, properties
+
+
+WORLD_BAKES_FAILED = set()   # stamps of worlds whose bake did not come back, this session
 
 
 class Session:
@@ -170,8 +176,14 @@ def start_session(engine, context, depsgraph):
         from . import bake
         original = getattr(scene, "original", scene)
         if settings.auto_bake and getattr(engine, "world_bake", None) is None and bake.world_needs_bake(original):
-            engine.world_bake = bake.start_world_bake(original)
-            engine_module.log("viewport: baking the world")
+            # A world whose bake failed is not tried again as it stands: every
+            # edit starts a session, and each would start a second Blender
+            # that fails the same way. Changing the world changes its stamp.
+            stamp = export.world_stamp(original)
+            if stamp not in WORLD_BAKES_FAILED:
+                engine.world_bake = bake.start_world_bake(original)
+                engine.world_bake_stamp = stamp
+                engine_module.log("viewport: baking the world")
     except Exception as error:
         engine_module.log("viewport: the world bake did not start: %s" % error)
     try:
@@ -209,6 +221,7 @@ def redraw_when_frames_arrive(engine_ref, session):
                 engine_module.log("viewport: the world is baked")
                 engine.restart_session()
                 return None
+            WORLD_BAKES_FAILED.add(getattr(engine, "world_bake_stamp", None))
         try:
             mtime = os.path.getmtime(session.frame_path)
         except OSError:

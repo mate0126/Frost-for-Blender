@@ -2,6 +2,8 @@
 # out, runs frost, follows its progress, and puts the picture in the render
 # window. A render is a subprocess, so cancelling is killing it.
 
+ADDON_VERSION = (1, 1, 9)   # which release this module belongs to; __init__ checks it
+
 import os
 import re
 import shutil
@@ -97,7 +99,14 @@ class FrostRenderEngine(bpy.types.RenderEngine):
     bl_label = "Frost"
     bl_use_preview = False
     bl_use_shading_nodes_custom = False
-    bl_use_eevee_viewport = False   # the Rendered viewport mode is Frost's own
+    # Material Preview is Eevee's, as it is with Cycles chosen: the scene under
+    # the viewport's own studio light, which is what the mode is for. Blender
+    # shows that mode with the scene's view transform and *without* its
+    # exposure, since the exposure belongs to the scene's own lamps -- so an
+    # engine that draws the scene's kilowatt lamps there, as Frost did with
+    # this off, comes out several stops over: a white product on black the
+    # moment Frost was chosen. Rendered is the engine's own either way.
+    bl_use_eevee_viewport = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
